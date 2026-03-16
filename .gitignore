@@ -75,3 +75,23 @@ $RECYCLE.BIN/
 *.p12
 appsettings.local.json
 secrets.json
+
+# Xcode — generated project files (use ios/project.yml + xcodegen to regenerate)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.xccheckout
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
