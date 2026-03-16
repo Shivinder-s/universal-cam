@@ -132,6 +132,25 @@ See `ios/UniversalCamPhone/Transport/PROTOCOL.md` for full details.
 
 ---
 
+## Contributing
+
+Contributions are welcome.
+
+- Start with `CONTRIBUTING.md` for setup, workflow, and pull request checklist.
+- Please follow `CODE_OF_CONDUCT.md` in all project interactions.
+- For major protocol or architecture changes, open an issue first to align on direction.
+
+---
+
 ## License
 
-TBD
+This project is open source under the MIT License.
+
+See `LICENSE` for full text.
+
+---
+
+## Third-Party Notices
+
+For open-source dependency attributions and framework notices, see
+`THIRD_PARTY_NOTICES.md`.
