@@ -20,7 +20,7 @@ final class VideoEncoder {
     /// Called when the encoder encounters an error.
     var onError: ((Error) -> Void)?
 
-    // MARK: - Private
+    // MARK: - Private (all accessed exclusively on encoderQueue)
 
     private var session:      VTCompressionSession?
     private let encoderQueue  = DispatchQueue(label: "com.universalcam.videoencoder")
@@ -39,13 +39,46 @@ final class VideoEncoder {
         }
     }
 
+    /// Encode a video sample buffer. Safe to call from any thread —
+    /// the actual encoding is dispatched to the encoder queue.
     func encode(_ sampleBuffer: CMSampleBuffer) {
+        // Retain the sample buffer for use on the encoder queue
+        let retained = sampleBuffer
+        encoderQueue.async { [weak self] in
+            self?.encodeOnQueue(retained)
+        }
+    }
+
+    func flush() {
+        encoderQueue.async { [weak self] in
+            guard let session = self?.session else { return }
+            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        }
+    }
+
+    func invalidate() {
+        encoderQueue.async { [weak self] in
+            guard let self, let session = self.session else { return }
+            VTCompressionSessionInvalidate(session)
+            self.session = nil
+        }
+    }
+
+    deinit {
+        if let session {
+            VTCompressionSessionInvalidate(session)
+        }
+    }
+
+    // MARK: - Private (must run on encoderQueue)
+
+    private func encodeOnQueue(_ sampleBuffer: CMSampleBuffer) {
         guard let session, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let dur = CMSampleBufferGetDuration(sampleBuffer)
 
         var flags: VTEncodeInfoFlags = []
-        // Force keyframe every 2 seconds
+        // Force keyframe every 2 seconds (at 30fps = 60 frames)
         let forceKeyframe = frameCount % 60 == 0
         let frameProperties: CFDictionary? = forceKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
@@ -66,29 +99,12 @@ final class VideoEncoder {
         frameCount += 1
     }
 
-    func flush() {
-        guard let session else { return }
-        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-    }
-
-    func invalidate() {
-        guard let session else { return }
-        VTCompressionSessionInvalidate(session)
-        self.session = nil
-    }
-
-    // MARK: - Private
-
     private func recreateSession() {
-        encoderQueue.async { [weak self] in
-            guard let self else { return }
-            if let session = self.session {
-                VTCompressionSessionInvalidate(session)
-                self.session = nil
-            }
-            self.createSession(width: self.lastWidth, height: self.lastHeight,
-                               fps: self.lastFPS, bitrate: self.lastBitrate)
+        if let session {
+            VTCompressionSessionInvalidate(session)
+            self.session = nil
         }
+        createSession(width: lastWidth, height: lastHeight, fps: lastFPS, bitrate: lastBitrate)
     }
 
     private func createSession(width: Int32, height: Int32, fps: Int32, bitrate: Int) {
@@ -117,7 +133,8 @@ final class VideoEncoder {
         }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime,          value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel,      value: kVTProfileLevel_H264_Baseline_AutoLevel)
+        // Main profile supports CABAC for better compression (Baseline does not)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel,      value: kVTProfileLevel_H264_Main_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate,    value: bitrate as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_H264EntropyMode,   value: kVTH264EntropyMode_CABAC)

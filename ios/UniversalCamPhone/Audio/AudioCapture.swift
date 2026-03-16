@@ -1,5 +1,6 @@
 import AVFoundation
 import AudioToolbox
+import CoreMedia
 
 /// Captures microphone audio via AVAudioEngine and encodes to AAC-LC frames.
 final class AudioCapture {
@@ -20,7 +21,6 @@ final class AudioCapture {
 
     private let engine = AVAudioEngine()
     private var aacConverter: AVAudioConverter?
-    private var sampleCount: Int64 = 0
     private let sampleRate: Double = 44100
 
     // MARK: - Lifecycle
@@ -55,7 +55,6 @@ final class AudioCapture {
         }
 
         aacConverter = AVAudioConverter(from: pcmFormat, to: aacFormat)
-        sampleCount = 0
 
         // Install tap on input node
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, time in
@@ -73,7 +72,10 @@ final class AudioCapture {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         aacConverter = nil
-        sampleCount = 0
+    }
+
+    deinit {
+        stop()
     }
 
     // MARK: - Processing
@@ -88,8 +90,14 @@ final class AudioCapture {
         } else {
             guard let formatConverter = AVAudioConverter(from: buffer.format, to: targetPCMFormat) else { return }
             guard let converted = AVAudioPCMBuffer(pcmFormat: targetPCMFormat, frameCapacity: buffer.frameLength) else { return }
+            var consumed = false
             var error: NSError?
             formatConverter.convert(to: converted, error: &error) { _, outStatus in
+                if consumed {
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                consumed = true
                 outStatus.pointee = .haveData
                 return buffer
             }
@@ -104,8 +112,14 @@ final class AudioCapture {
             maximumPacketSize: 768
         ) as AVAudioCompressedBuffer? else { return }
 
+        var consumed = false
         var error: NSError?
         converter.convert(to: aacBuffer, error: &error) { _, outStatus in
+            if consumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
             outStatus.pointee = .haveData
             return pcmBuffer
         }
@@ -118,8 +132,19 @@ final class AudioCapture {
         guard aacBuffer.byteLength > 0 else { return }
 
         let data = Data(bytes: aacBuffer.data, count: Int(aacBuffer.byteLength))
-        let ptsUs = Int64(Double(sampleCount) / sampleRate * 1_000_000)
-        sampleCount += Int64(pcmBuffer.frameLength)
+
+        // Derive PTS from AVAudioTime's hostTime to align with video CMTime clock.
+        // AVAudioTime.hostTime is in mach_absolute_time units; convert to microseconds
+        // using the same clock base that CMTime uses.
+        let ptsUs: Int64
+        if time.isHostTimeValid {
+            let hostTimeNs = AVAudioTime.seconds(forHostTime: time.hostTime)
+            ptsUs = Int64(hostTimeNs * 1_000_000)
+        } else {
+            // Fallback: use current time
+            let cmNow = CMClockGetTime(CMClockGetHostTimeClock())
+            ptsUs = Int64(CMTimeGetSeconds(cmNow) * 1_000_000)
+        }
 
         let channelCount = Int(converter.outputFormat.channelCount)
         let frame = AudioFrame(data: data, ptsUs: ptsUs, channels: channelCount)

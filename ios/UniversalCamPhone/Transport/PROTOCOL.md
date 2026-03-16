@@ -78,9 +78,37 @@ iPhone initiates connection to discovered PC IP address.
 
 ---
 
-## 3. Control Messages (JSON)
+## 3. Stream Type Multiplexing
 
-All control messages are **JSON objects** terminated by newline (`\n` = 0x0A).
+Every message on the wire is prefixed by a **1-byte stream type** that tells the
+receiver how to interpret the rest of the data:
+
+| Value | Stream | Direction | Framing |
+|-------|--------|-----------|---------|
+| `0x00` | Control | Bidirectional | JSON + newline (0x0A) |
+| `0x01` | Video | Phone → PC | Binary frame header + payload |
+| `0x02` | Audio | Phone → PC | Binary frame header + payload |
+
+The stream type byte is **always** the first byte of every send. Receivers must
+read this byte first to decide whether to parse JSON or a binary frame header.
+
+---
+
+## 4. Control Messages (JSON)
+
+All control messages are prefixed by `0x00` (stream type), followed by a
+**JSON object**, terminated by newline (`\n` = 0x0A).
+
+### Wire Format
+```
+┌──────────────────────────────────────────┐
+│ Stream Type (1 byte = 0x00)             │ Byte 0
+├──────────────────────────────────────────┤
+│ JSON payload (N bytes, UTF-8)           │ Bytes 1 .. N
+├──────────────────────────────────────────┤
+│ Newline delimiter (1 byte = 0x0A)       │ Byte N+1
+└──────────────────────────────────────────┘
+```
 
 ### Message Format
 ```json
@@ -90,7 +118,7 @@ All control messages are **JSON objects** terminated by newline (`\n` = 0x0A).
 }
 ```
 
-### 3.1 Welcome (PC → iPhone)
+### 4.1 Welcome (PC → iPhone)
 
 Sent immediately after QUIC connection established.
 
@@ -104,7 +132,7 @@ Sent immediately after QUIC connection established.
 
 ---
 
-### 3.2 Hello (iPhone → PC)
+### 4.2 Hello (iPhone → PC)
 
 iPhone introduces itself with capabilities.
 
@@ -127,7 +155,7 @@ iPhone introduces itself with capabilities.
 
 ---
 
-### 3.3 Configure (PC → iPhone)
+### 4.3 Configure (PC → iPhone)
 
 PC requests specific encoding settings.
 
@@ -151,7 +179,7 @@ PC requests specific encoding settings.
 
 ---
 
-### 3.4 Configure Ack (iPhone → PC)
+### 4.4 Configure Ack (iPhone → PC)
 
 iPhone confirms configuration applied.
 
@@ -169,7 +197,7 @@ iPhone confirms configuration applied.
 
 ---
 
-### 3.5 Start Stream (iPhone → PC)
+### 4.5 Start Stream (iPhone → PC)
 
 iPhone signals it's starting to send media frames.
 
@@ -183,7 +211,7 @@ iPhone signals it's starting to send media frames.
 
 ---
 
-### 3.6 Stop Stream (Either → Other)
+### 4.6 Stop Stream (Either → Other)
 
 Request to stop media transmission.
 
@@ -197,7 +225,7 @@ Request to stop media transmission.
 
 ---
 
-### 3.7 Ping (Either → Other)
+### 4.7 Ping (Either → Other)
 
 Measure round-trip time.
 
@@ -215,7 +243,7 @@ Measure round-trip time.
 
 ---
 
-### 3.8 Pong (Response to Ping)
+### 4.8 Pong (Response to Ping)
 
 ```json
 {
@@ -231,21 +259,24 @@ Measure round-trip time.
 
 ---
 
-## 4. Binary Media Frames
+## 5. Binary Media Frames
 
 After `start_stream`, iPhone sends continuous binary frames for video and audio.
+Each frame is prefixed by its stream type byte (`0x01` for video, `0x02` for audio).
 
-### Frame Structure
+### Frame Structure (14-byte header + payload)
 
 ```
 ┌────────────────────────────────────────┐
-│ Payload Length (4 bytes, LE uint32)   │ Bytes 0-3
+│ Stream Type (1 byte)                  │ Byte 0      (0x01=video, 0x02=audio)
 ├────────────────────────────────────────┤
-│ PTS in microseconds (8 bytes, LE i64) │ Bytes 4-11
+│ Payload Length (4 bytes, LE uint32)   │ Bytes 1-4
 ├────────────────────────────────────────┤
-│ Flags (1 byte)                         │ Byte 12
+│ PTS in microseconds (8 bytes, LE i64) │ Bytes 5-12
 ├────────────────────────────────────────┤
-│ Payload (N bytes)                      │ Bytes 13+
+│ Flags (1 byte)                         │ Byte 13
+├────────────────────────────────────────┤
+│ Payload (N bytes)                      │ Bytes 14+
 └────────────────────────────────────────┘
 ```
 
@@ -253,9 +284,9 @@ After `start_stream`, iPhone sends continuous binary frames for video and audio.
 
 ---
 
-### 4.1 Video Frames
+### 5.1 Video Frames
 
-#### Flags (byte 12)
+#### Flags (byte 13)
 ```
 Bit 0: Keyframe (1 = keyframe, 0 = delta frame)
 Bit 1: Codec (0 = H.264, 1 = HEVC) [future]
@@ -280,6 +311,7 @@ Bits 2-7: Reserved (set to 0)
 
 ```
 Hex dump:
+01  ← Stream type: video
 00 00 00 A4  ← Length = 164 bytes
 00 00 00 00 00 00 00 00  ← PTS = 0 μs
 01  ← Flags: keyframe=1, hevc=0
@@ -289,9 +321,9 @@ Hex dump:
 
 ---
 
-### 4.2 Audio Frames
+### 5.2 Audio Frames
 
-#### Flags (byte 12)
+#### Flags (byte 13)
 ```
 Value: Number of channels
   1 = Mono
@@ -308,6 +340,7 @@ Raw AAC frames (may include ADTS headers or just raw AAC)
 
 ```
 Hex dump:
+02  ← Stream type: audio
 00 04 00 00  ← Length = 1024 bytes
 15 CD 5B 00 00 00 00 00  ← PTS = 6000000 μs (6 sec)
 02  ← Flags: 2 channels (stereo)
@@ -317,15 +350,15 @@ FF F1 50 80 ...  ← AAC data
 
 ---
 
-## 5. Timing & Synchronization
+## 6. Timing & Synchronization
 
 ### Presentation Timestamps (PTS)
 
 - **Unit**: Microseconds (μs)
-- **Origin**: Time since stream started (not Unix epoch)
+- **Origin**: Host time clock (shared between audio and video for A/V sync)
 - **Encoding**: 64-bit signed integer, little-endian
-- **Video**: Based on CMSampleBuffer presentation time
-- **Audio**: Based on AVAudioTime or elapsed time
+- **Video**: Based on CMSampleBuffer presentation time (CMClock host time)
+- **Audio**: Based on AVAudioTime host time (same clock domain as video)
 
 ### Frame Timing
 
@@ -342,7 +375,7 @@ FF F1 50 80 ...  ← AAC data
 
 ---
 
-## 6. Error Handling
+## 7. Error Handling
 
 ### Connection Failures
 
@@ -364,7 +397,7 @@ FF F1 50 80 ...  ← AAC data
 
 ---
 
-## 7. Performance Characteristics
+## 8. Performance Characteristics
 
 ### Typical Metrics
 
@@ -385,7 +418,7 @@ FF F1 50 80 ...  ← AAC data
 
 ---
 
-## 8. Security
+## 9. Security
 
 ### TLS Configuration
 
@@ -413,7 +446,7 @@ sec_protocol_options_set_verify_block { _, sec_trust, completion in
 
 ---
 
-## 9. Implementation Notes
+## 10. Implementation Notes
 
 ### iPhone (Sender)
 
@@ -442,41 +475,45 @@ sec_protocol_options_set_verify_block { _, sec_trust, completion in
 
 ---
 
-## 10. Example Packet Captures
+## 11. Example Packet Captures
 
 ### Control Message Exchange
 
+Each control message is prefixed by `0x00` (stream type) and terminated by `0x0A` (newline):
+
 ```
-→ {"type":"welcome"}\n
-← {"type":"hello","deviceName":"iPhone 15","capabilities":["h264","aac_lc","stereo_audio"]}\n
-→ {"type":"configure","resolution":"1920x1080","fps":30,"codec":"h264","bitrate":8000000}\n
-← {"type":"configure_ack","resolution":"1920x1080","fps":30}\n
-← {"type":"start_stream"}\n
+→ 0x00 {"type":"welcome"} 0x0A
+← 0x00 {"type":"hello","deviceName":"iPhone 15","capabilities":["h264","aac_lc","stereo_audio"]} 0x0A
+→ 0x00 {"type":"configure","resolution":"1920x1080","fps":30,"codec":"h264","bitrate":8000000} 0x0A
+← 0x00 {"type":"configure_ack","resolution":"1920x1080","fps":30} 0x0A
+← 0x00 {"type":"start_stream"} 0x0A
 ```
 
 ### First Video Frame (SPS+PPS+IDR)
 
 ```
-Bytes: 4829
-  [0-3]:   BD 12 00 00           ← Length: 4797
-  [4-11]:  00 00 00 00 00 00 00 00  ← PTS: 0
-  [12]:    01                    ← Keyframe
-  [13+]:   00 00 00 01 67 42 ...  ← H.264 Annex B
+Bytes: 4811 (14-byte header + 4797-byte payload)
+  [0]:     01                       ← Stream type: video
+  [1-4]:   BD 12 00 00              ← Length: 4797
+  [5-12]:  00 00 00 00 00 00 00 00  ← PTS: 0
+  [13]:    01                       ← Keyframe
+  [14+]:   00 00 00 01 67 42 ...    ← H.264 Annex B
 ```
 
 ### Subsequent P-Frame
 
 ```
-Bytes: 1245
-  [0-3]:   D5 04 00 00           ← Length: 1237
-  [4-11]:  15 82 00 00 00 00 00 00  ← PTS: 33333
-  [12]:    00                    ← Not keyframe
-  [13+]:   00 00 00 01 61 ...     ← P-frame NAL
+Bytes: 1251 (14-byte header + 1237-byte payload)
+  [0]:     01                       ← Stream type: video
+  [1-4]:   D5 04 00 00              ← Length: 1237
+  [5-12]:  15 82 00 00 00 00 00 00  ← PTS: 33333
+  [13]:    00                       ← Not keyframe
+  [14+]:   00 00 00 01 61 ...       ← P-frame NAL
 ```
 
 ---
 
-## 11. Testing Tools
+## 12. Testing Tools
 
 ### Wireshark Filter
 

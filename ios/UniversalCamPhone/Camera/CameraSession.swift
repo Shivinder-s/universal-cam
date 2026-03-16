@@ -26,7 +26,6 @@ final class CameraSession: NSObject, ObservableObject {
 
     private let sessionQueue = DispatchQueue(label: "com.universalcam.camera.session")
     private var videoOutput  = AVCaptureVideoDataOutput()
-    private var audioOutput  = AVCaptureAudioDataOutput()
 
     /// Called with each encoded video sample. Set by ConnectionManager.
     var onVideoSampleBuffer: ((CMSampleBuffer) -> Void)?
@@ -171,7 +170,6 @@ final class CameraSession: NSObject, ObservableObject {
             DispatchQueue.main.async { self.currentCameraID = device.uniqueID }
         }
 
-        addAudioInput()
         addVideoOutput()
 
         captureSession.commitConfiguration()
@@ -180,15 +178,6 @@ final class CameraSession: NSObject, ObservableObject {
     private func addVideoInput(device: AVCaptureDevice) {
         guard let input = try? AVCaptureDeviceInput(device: device),
               captureSession.canAddInput(input) else { return }
-        captureSession.addInput(input)
-    }
-
-    private func addAudioInput() {
-        guard
-            let device = AVCaptureDevice.default(for: .audio),
-            let input  = try? AVCaptureDeviceInput(device: device),
-            captureSession.canAddInput(input)
-        else { return }
         captureSession.addInput(input)
     }
 
@@ -201,12 +190,14 @@ final class CameraSession: NSObject, ObservableObject {
         guard captureSession.canAddOutput(videoOutput) else { return }
         captureSession.addOutput(videoOutput)
 
-        // Lock orientation — rotation is handled on the Windows side
+        // Lock to landscape-right (sensor native) — rotation handled on the Windows side.
+        // videoRotationAngle 0° = sensor native = landscape-right on iOS cameras.
+        // The deprecated videoOrientation .landscapeRight is the equivalent for < iOS 17.
         if let connection = videoOutput.connection(with: .video) {
             if #available(iOS 17.0, *) {
                 connection.videoRotationAngle = 0
             } else {
-                connection.videoOrientation = .portrait
+                connection.videoOrientation = .landscapeRight
             }
         }
     }

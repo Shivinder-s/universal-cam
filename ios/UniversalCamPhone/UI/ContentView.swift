@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 struct ContentView: View {
 
@@ -6,71 +7,147 @@ struct ContentView: View {
     @EnvironmentObject var camera:     CameraSession
 
     @State private var showSettings = false
+    @State private var cameraAuthorized = true
+    @State private var micAuthorized = true
 
     var body: some View {
         ZStack {
-            // Full-screen camera preview (blurred)
-            CameraPreviewView(session: camera.captureSession)
-                .ignoresSafeArea()
-                .onAppear {
-                    camera.start()
-                    connection.startDiscovery()
-                }
-                .onDisappear { camera.stop() }
+            if !cameraAuthorized {
+                // Permission denied overlay
+                PermissionDeniedView(
+                    cameraAuthorized: cameraAuthorized,
+                    micAuthorized: micAuthorized
+                )
+            } else {
+                // Full-screen camera preview
+                CameraPreviewView(session: camera.captureSession)
+                    .ignoresSafeArea()
+                    .onAppear {
+                        camera.start()
+                        connection.startDiscovery()
+                    }
+                    .onDisappear { camera.stop() }
+            }
 
-            // Status overlay
-            VStack {
-                HStack {
-                    StatusPill(
-                        state: connection.state,
-                        latency: connection.latencyMs,
-                        transport: connection.activeTransport
-                    )
-                    .padding(.top, 56)
-                    .padding(.leading, 16)
+            // Status overlay (always visible when camera is active)
+            if cameraAuthorized {
+                VStack {
+                    HStack {
+                        StatusPill(
+                            state: connection.state,
+                            latency: connection.latencyMs,
+                            transport: connection.activeTransport
+                        )
+                        .padding(.top, 56)
+                        .padding(.leading, 16)
+                        Spacer()
+
+                        // Settings
+                        Button {
+                            showSettings = true
+                        } label: {
+                            Image(systemName: "gearshape.fill")
+                                .font(.system(size: 22))
+                                .foregroundStyle(.white)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .padding(.top, 56)
+                        .padding(.trailing, 16)
+                    }
+
                     Spacer()
 
-                    // Settings
-                    Button {
-                        showSettings = true
-                    } label: {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 22))
-                            .foregroundStyle(.white)
-                            .padding(10)
-                            .background(.ultraThinMaterial, in: Circle())
+                    if !micAuthorized {
+                        Text("Microphone access denied — audio will not stream.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 4)
                     }
-                    .padding(.top, 56)
-                    .padding(.trailing, 16)
-                }
 
-                Spacer()
-
-                // Connection hint when idle
-                if case .idle = connection.state {
-                    Text("Waiting for PC connection...")
-                        .font(.callout)
-                        .foregroundStyle(.white.opacity(0.7))
-                        .padding(.bottom, 48)
-                } else if case .discovering = connection.state {
-                    VStack(spacing: 4) {
-                        Text("Searching for PC on local network...")
+                    // Connection hint when idle
+                    if case .idle = connection.state {
+                        Text("Waiting for PC connection...")
                             .font(.callout)
                             .foregroundStyle(.white.opacity(0.7))
-                        if connection.usbListening {
-                            Text("Also listening for USB connection on port \(USBTransport.port)")
-                                .font(.caption)
-                                .foregroundStyle(.white.opacity(0.5))
+                            .padding(.bottom, 48)
+                    } else if case .discovering = connection.state {
+                        VStack(spacing: 4) {
+                            Text("Searching for PC on local network...")
+                                .font(.callout)
+                                .foregroundStyle(.white.opacity(0.7))
+                            if connection.usbListening {
+                                Text("Also listening for USB connection on port \(USBTransport.port)")
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
                         }
+                        .padding(.bottom, 48)
                     }
-                    .padding(.bottom, 48)
                 }
             }
         }
+        .task { await checkPermissions() }
         .sheet(isPresented: $showSettings) {
             SettingsView()
                 .environmentObject(connection)
                 .environmentObject(camera)
+        }
+    }
+
+    private func checkPermissions() async {
+        // Camera
+        let camStatus = AVCaptureDevice.authorizationStatus(for: .video)
+        if camStatus == .notDetermined {
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            await MainActor.run { cameraAuthorized = granted }
+        } else {
+            await MainActor.run { cameraAuthorized = camStatus == .authorized }
+        }
+
+        // Microphone
+        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        if micStatus == .notDetermined {
+            let granted = await AVCaptureDevice.requestAccess(for: .audio)
+            await MainActor.run { micAuthorized = granted }
+        } else {
+            await MainActor.run { micAuthorized = micStatus == .authorized }
+        }
+    }
+}
+
+// MARK: - Permission Denied
+
+private struct PermissionDeniedView: View {
+    let cameraAuthorized: Bool
+    let micAuthorized: Bool
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VStack(spacing: 20) {
+                Image(systemName: "camera.fill")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.secondary)
+
+                Text("Camera Access Required")
+                    .font(.title2.bold())
+                    .foregroundStyle(.white)
+
+                Text("UniversalCam needs camera access to stream video to your PC. Open Settings to grant permission.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+
+                Button("Open Settings") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
         }
     }
 }
@@ -163,15 +240,16 @@ private struct SettingsView: View {
                         }
                     } else {
                         ForEach(connection.discoveredPeers, id: \.self) { peer in
+                            let name = ConnectionManager.displayName(for: peer)
                             Button {
                                 connection.connect(to: peer)
                                 dismiss()
                             } label: {
                                 HStack {
                                     Image(systemName: "desktopcomputer")
-                                    Text(peer)
+                                    Text(name)
                                     Spacer()
-                                    if connection.peerHost == peer {
+                                    if connection.peerHost == name {
                                         Image(systemName: "checkmark.circle.fill")
                                             .foregroundStyle(.green)
                                     }

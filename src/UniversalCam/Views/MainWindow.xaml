@@ -1,0 +1,114 @@
+<Window
+    x:Class="UniversalCam.Views.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="UniversalCam"
+    Width="1280" Height="720"
+    MinWidth="640" MinHeight="360"
+    Background="#1C1C1C"
+    WindowStyle="SingleBorderWindow">
+
+    <Grid>
+
+        <!-- ── Video preview (fills the window) ────────────────────── -->
+        <Image
+            x:Name="imgPreview"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Stretch"
+            Stretch="Uniform"
+            RenderOptions.BitmapScalingMode="NearestNeighbor" />
+
+        <!-- ── Placeholder shown when no stream is active ───────────── -->
+        <StackPanel
+            x:Name="pnlNoStream"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center">
+            <TextBlock
+                FontSize="64"
+                Foreground="#555"
+                HorizontalAlignment="Center"
+                Text="📷" />
+            <TextBlock
+                x:Name="txtWaiting"
+                FontSize="18"
+                Foreground="#888"
+                HorizontalAlignment="Center"
+                Margin="0,12,0,0"
+                Text="Waiting for iPhone…" />
+        </StackPanel>
+
+        <!-- ── Status bar (bottom) ──────────────────────────────────── -->
+        <Border
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Bottom"
+            Background="#CC1A1A1A"
+            CornerRadius="8,8,0,0"
+            Padding="16,8">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Left: connection status -->
+                <StackPanel
+                    Grid.Column="0"
+                    Orientation="Horizontal"
+                    VerticalAlignment="Center">
+                    <Ellipse
+                        x:Name="ellStatus"
+                        Width="10" Height="10"
+                        Fill="Gray"
+                        VerticalAlignment="Center"
+                        Margin="0,0,8,0" />
+                    <TextBlock
+                        x:Name="txtStatus"
+                        FontSize="13"
+                        Foreground="White"
+                        VerticalAlignment="Center"
+                        Text="Idle" />
+                    <Border
+                        x:Name="badgeTransport"
+                        CornerRadius="4"
+                        Padding="6,2"
+                        Margin="8,0,0,0"
+                        Visibility="Collapsed">
+                        <TextBlock
+                            x:Name="txtTransport"
+                            FontSize="11"
+                            FontWeight="SemiBold"
+                            Foreground="White" />
+                    </Border>
+                </StackPanel>
+
+                <!-- Centre: resolution / fps -->
+                <TextBlock
+                    x:Name="txtInfo"
+                    Grid.Column="1"
+                    FontSize="13"
+                    Foreground="#888"
+                    Margin="16,0"
+                    VerticalAlignment="Center" />
+
+                <!-- Right: controls -->
+                <StackPanel
+                    Grid.Column="2"
+                    Orientation="Horizontal">
+                    <Button
+                        x:Name="btnFlip"
+                        Content="Flip Camera"
+                        IsEnabled="False"
+                        Margin="0,0,8,0"
+                        Click="OnFlipClicked" />
+                    <Button
+                        x:Name="btnStop"
+                        Content="Stop"
+                        IsEnabled="False"
+                        Click="OnStopClicked" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+    </Grid>
+</Window>

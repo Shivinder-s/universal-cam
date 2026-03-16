@@ -5,6 +5,14 @@
     <Platforms>x64</Platforms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- mDNS/Bonjour service advertisement and discovery -->
+    <PackageReference Include="Makaretu.Dns.Multicast" Version="0.27.0" />
+    <!-- JSON serialization for control messages -->
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
 
 </Project>

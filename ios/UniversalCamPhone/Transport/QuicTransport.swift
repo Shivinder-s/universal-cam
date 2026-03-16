@@ -14,6 +14,8 @@ import Foundation
 ///   [8 bytes: pts_us int64 LE]
 ///   [1 byte:  flags]  video: bit0=keyframe, bit1=hevc; audio: channels (1 or 2)
 ///   [N bytes: payload]
+///
+/// All mutable state is accessed exclusively on `queue` for thread safety.
 final class QuicTransport {
 
     // MARK: - Constants
@@ -28,117 +30,209 @@ final class QuicTransport {
         case audio   = 0x02
     }
 
+    /// Header size for binary media frames: stream_type(1) + length(4) + pts(8) + flags(1)
+    private static let frameHeaderSize = 14
+
     // MARK: - Callbacks
 
     var onControlMessage: ((Data) -> Void)?
     var onStateChange:    ((NWConnection.State) -> Void)?
 
-    // MARK: - Private
+    // MARK: - Private (accessed on `queue`)
 
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.universalcam.quic", qos: .userInteractive)
     private var retryCount = 0
     private static let maxRetries = 10
 
+    /// Accumulation buffer for reassembling partial messages from the receive loop.
+    private var receiveBuffer = Data()
+
+    /// Flow control: number of sends in flight (not yet completed).
+    private var sendsInFlight = 0
+    private static let maxSendsInFlight = 30
+
+    /// The endpoint we're connecting to, for reconnect logic.
+    private var currentEndpoint: NWEndpoint?
+
     // MARK: - Connection
 
+    /// Connect to a discovered Bonjour service endpoint (preferred for NWBrowser results).
+    func connect(to endpoint: NWEndpoint) {
+        queue.async { [self] in
+            currentEndpoint = endpoint
+            let params = makeQUICParameters()
+            startConnection(NWConnection(to: endpoint, using: params))
+        }
+    }
+
+    /// Connect to a host/port pair directly.
     func connect(to host: String, port: UInt16 = QuicTransport.port) {
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: port)!
-        )
-        let params = makeQUICParameters()
-        let conn = NWConnection(to: endpoint, using: params)
+        queue.async { [self] in
+            let endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: port)!
+            )
+            currentEndpoint = endpoint
+            let params = makeQUICParameters()
+            startConnection(NWConnection(to: endpoint, using: params))
+        }
+    }
+
+    /// Must be called on `queue`.
+    private func startConnection(_ conn: NWConnection) {
+        // Cancel any existing connection to avoid leaking it
+        connection?.cancel()
+
         self.connection = conn
+        self.receiveBuffer = Data()
+        self.sendsInFlight = 0
         conn.stateUpdateHandler = { [weak self] state in
+            // NWConnection delivers state updates on its queue (which is our queue)
             self?.onStateChange?(state)
             if case .ready = state {
                 self?.retryCount = 0
+                self?.sendsInFlight = 0
             }
-            if case .failed = state { self?.scheduleReconnect(host: host, port: port) }
+            if case .failed = state { self?.scheduleReconnect() }
         }
         conn.start(queue: queue)
         receiveLoop(conn)
     }
 
     func disconnect() {
-        connection?.cancel()
-        connection = nil
-        retryCount = 0
+        queue.async { [self] in
+            connection?.cancel()
+            connection = nil
+            currentEndpoint = nil
+            retryCount = 0
+            receiveBuffer = Data()
+            sendsInFlight = 0
+        }
     }
 
     // MARK: - Send
 
     func sendControl(_ message: ControlMessage) {
-        guard let data = try? JSONEncoder().encode(message),
-              let conn = connection
-        else { return }
+        guard let data = try? JSONEncoder().encode(message) else { return }
         var payload = Data([StreamType.control.rawValue])
         payload.append(data)
         payload.append(0x0A) // newline delimiter
-        conn.send(content: payload, completion: .idempotent)
+        queue.async { [self] in
+            guard let conn = connection else { return }
+            sendWithFlowControl(conn, data: payload)
+        }
     }
 
     func sendVideoFrame(_ frame: VideoEncoder.EncodedFrame) {
-        guard let conn = connection else { return }
         let flags: UInt8 = frame.isKeyframe ? 0x01 : 0x00
         let packet = makeFramePacket(streamType: .video, payload: frame.data, ptsUs: frame.ptsUs, flags: flags)
-        conn.send(content: packet, completion: .idempotent)
+        queue.async { [self] in
+            guard let conn = connection else { return }
+            // Drop frames if the send queue is backed up
+            guard sendsInFlight < Self.maxSendsInFlight else { return }
+            sendWithFlowControl(conn, data: packet)
+        }
     }
 
     func sendAudioFrame(_ frame: AudioCapture.AudioFrame) {
-        guard let conn = connection else { return }
         let flags = UInt8(frame.channels)
         let packet = makeFramePacket(streamType: .audio, payload: frame.data, ptsUs: frame.ptsUs, flags: flags)
-        conn.send(content: packet, completion: .idempotent)
+        queue.async { [self] in
+            guard let conn = connection else { return }
+            guard sendsInFlight < Self.maxSendsInFlight else { return }
+            sendWithFlowControl(conn, data: packet)
+        }
     }
 
-    // MARK: - Receive Loop
+    /// Send data with backpressure tracking. Must be called on `queue`.
+    private func sendWithFlowControl(_ conn: NWConnection, data: Data) {
+        sendsInFlight += 1
+        conn.send(content: data, completion: .contentProcessed { [weak self] error in
+            // Completion is delivered on the connection's queue (which is our queue)
+            guard let self else { return }
+            self.sendsInFlight = max(0, self.sendsInFlight - 1)
+            if let error {
+                print("[QuicTransport] Send error: \(error)")
+            }
+        })
+    }
+
+    // MARK: - Receive Loop with Reassembly
 
     private func receiveLoop(_ conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             if let data, !data.isEmpty {
-                self?.demultiplex(data)
+                self?.receiveBuffer.append(data)
+                self?.processReceiveBuffer()
             }
-            if !isComplete && error == nil {
-                self?.receiveLoop(conn)
+            if isComplete || error != nil {
+                return
             }
+            self?.receiveLoop(conn)
         }
     }
 
-    /// Demultiplex received data based on the stream type prefix byte.
-    private func demultiplex(_ data: Data) {
-        guard let firstByte = data.first else { return }
+    /// Consume complete messages from the receive buffer.
+    /// The PC only sends control messages (stream type 0x00, newline-delimited JSON).
+    /// We also handle the theoretical case of binary frames from the PC.
+    private func processReceiveBuffer() {
+        while !receiveBuffer.isEmpty {
+            guard let firstByte = receiveBuffer.first else { break }
 
-        if firstByte == StreamType.control.rawValue {
-            // Strip the stream type prefix and forward control data
-            let controlData = data.dropFirst()
-            if !controlData.isEmpty {
-                onControlMessage?(Data(controlData))
+            if firstByte == StreamType.control.rawValue {
+                // Control message: 0x00 prefix + JSON + 0x0A newline
+                guard let newlineIndex = receiveBuffer.dropFirst(1).firstIndex(of: 0x0A) else {
+                    break
+                }
+                let jsonData = Data(receiveBuffer[receiveBuffer.startIndex + 1 ..< newlineIndex])
+                receiveBuffer = Data(receiveBuffer[(newlineIndex + 1)...])
+                if !jsonData.isEmpty {
+                    onControlMessage?(jsonData)
+                }
+
+            } else if firstByte == StreamType.video.rawValue || firstByte == StreamType.audio.rawValue {
+                guard receiveBuffer.count >= Self.frameHeaderSize else { break }
+                let payloadLength = receiveBuffer.withUnsafeBytes { ptr -> Int in
+                    let base = ptr.baseAddress!.advanced(by: 1)
+                    return Int(base.loadUnaligned(as: UInt32.self).littleEndian)
+                }
+                let totalFrameSize = Self.frameHeaderSize + payloadLength
+                guard receiveBuffer.count >= totalFrameSize else { break }
+                receiveBuffer = Data(receiveBuffer.dropFirst(totalFrameSize))
+
+            } else {
+                // Unknown stream type — try to treat as raw JSON (legacy/fallback)
+                if let newlineIndex = receiveBuffer.firstIndex(of: 0x0A) {
+                    let lineData = Data(receiveBuffer[receiveBuffer.startIndex ..< newlineIndex])
+                    receiveBuffer = Data(receiveBuffer[(newlineIndex + 1)...])
+                    if !lineData.isEmpty {
+                        onControlMessage?(lineData)
+                    }
+                } else {
+                    break
+                }
             }
-        } else {
-            // From the PC side we only expect control messages;
-            // video/audio are phone→PC only. Forward as control for safety.
-            onControlMessage?(data)
         }
     }
 
     // MARK: - Helpers
 
     private func makeQUICParameters() -> NWParameters {
-        let tlsOptions = NWProtocolTLS.Options()
+        let quicOptions = NWProtocolQUIC.Options(alpn: ["universalcam/1"])
+
+        // Configure TLS on the QUIC options directly
+        let secOptions = quicOptions.securityProtocolOptions
 
         #if DEBUG
-        // Accept self-signed certificates in debug builds for local testing
         sec_protocol_options_set_verify_block(
-            tlsOptions.securityProtocolOptions,
+            secOptions,
             { _, _, completion in completion(true) },
             queue
         )
         #else
-        // Validate certificates via system trust store in release builds
         sec_protocol_options_set_verify_block(
-            tlsOptions.securityProtocolOptions,
+            secOptions,
             { _, sec_trust, completion in
                 let trust = sec_trust_copy_ref(sec_trust).takeRetainedValue()
                 var error: CFError?
@@ -149,7 +243,6 @@ final class QuicTransport {
         )
         #endif
 
-        let quicOptions = NWProtocolQUIC.Options(alpn: ["universalcam/1"])
         let params = NWParameters(quic: quicOptions)
         return params
     }
@@ -157,6 +250,7 @@ final class QuicTransport {
     /// Builds the binary frame: [stream_type][length][pts][flags][payload]
     private func makeFramePacket(streamType: StreamType, payload: Data, ptsUs: Int64, flags: UInt8) -> Data {
         var packet = Data()
+        packet.reserveCapacity(Self.frameHeaderSize + payload.count)
         packet.append(streamType.rawValue)
         var length = UInt32(payload.count).littleEndian
         var pts    = ptsUs.littleEndian
@@ -169,7 +263,9 @@ final class QuicTransport {
 
     // MARK: - Reconnect
 
-    private func scheduleReconnect(host: String, port: UInt16) {
+    /// Must be called on `queue`.
+    private func scheduleReconnect() {
+        guard let endpoint = currentEndpoint else { return }
         guard retryCount < Self.maxRetries else {
             print("[QuicTransport] Max retries reached, giving up")
             return
@@ -178,7 +274,10 @@ final class QuicTransport {
         retryCount += 1
         print("[QuicTransport] Reconnecting in \(delay)s (attempt \(retryCount)/\(Self.maxRetries))")
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.connect(to: host, port: port)
+            guard let self else { return }
+            self.currentEndpoint = endpoint
+            let params = self.makeQUICParameters()
+            self.startConnection(NWConnection(to: endpoint, using: params))
         }
     }
 }

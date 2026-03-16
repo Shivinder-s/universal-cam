@@ -28,7 +28,7 @@ final class ConnectionManager: ObservableObject {
     @Published var state:       State  = .idle
     @Published var peerHost:    String = ""
     @Published var latencyMs:   Int    = 0
-    @Published var discoveredPeers: [String] = []
+    @Published var discoveredPeers: [NWEndpoint] = []
     @Published var activeTransport: TransportType? = nil
     @Published var usbListening: Bool = false
 
@@ -70,6 +70,16 @@ final class ConnectionManager: ObservableObject {
         usbTransport.startListening()
     }
 
+    /// Connect to a discovered Bonjour service endpoint.
+    func connect(to endpoint: NWEndpoint) {
+        let displayName = Self.displayName(for: endpoint)
+        state = .connecting(host: displayName)
+        peerHost = displayName
+        activeTransport = .wifi
+        wifiTransport.connect(to: endpoint)
+    }
+
+    /// Connect to a specific host/port (for manual IP entry).
     func connect(to host: String, port: UInt16 = 7779) {
         state = .connecting(host: host)
         peerHost = host
@@ -323,18 +333,17 @@ final class ConnectionManager: ObservableObject {
 
     // MARK: - Incoming Control Messages
 
+    /// Parse a control message received from a transport.
+    /// The transport layer handles framing/reassembly, so each callback delivers
+    /// exactly one complete JSON message (without the stream type prefix or newline).
     private func parseControlMessage(_ data: Data, from transport: TransportType) {
-        let lines = data.split(separator: 0x0A)
+        guard let message = try? JSONDecoder().decode(ControlMessage.self, from: data) else {
+            print("[ConnectionManager] Failed to decode control message (\(data.count) bytes)")
+            return
+        }
 
-        for line in lines {
-            guard let message = try? JSONDecoder().decode(ControlMessage.self, from: Data(line)) else {
-                print("[ConnectionManager] Failed to decode control message")
-                continue
-            }
-
-            DispatchQueue.main.async {
-                self.handleIncomingControl(message, from: transport)
-            }
+        DispatchQueue.main.async {
+            self.handleIncomingControl(message, from: transport)
         }
     }
 
@@ -426,6 +435,20 @@ final class ConnectionManager: ObservableObject {
 
         default:
             break
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// Extract a human-readable display name from an NWEndpoint.
+    static func displayName(for endpoint: NWEndpoint) -> String {
+        switch endpoint {
+        case .service(let name, _, _, _):
+            return name
+        case .hostPort(let host, let port):
+            return "\(host):\(port)"
+        default:
+            return "\(endpoint)"
         }
     }
 }
