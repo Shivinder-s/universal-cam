@@ -17,11 +17,19 @@ final class VideoEncoder {
     /// Called on the encoder's private queue for each encoded frame.
     var onEncodedFrame: ((EncodedFrame) -> Void)?
 
+    /// Called when the encoder encounters an error.
+    var onError: ((Error) -> Void)?
+
     // MARK: - Private
 
     private var session:      VTCompressionSession?
     private let encoderQueue  = DispatchQueue(label: "com.universalcam.videoencoder")
     private var frameCount    = 0
+
+    private var lastWidth: Int32 = 1920
+    private var lastHeight: Int32 = 1080
+    private var lastFPS: Int32 = 30
+    private var lastBitrate: Int = 8_000_000
 
     // MARK: - Lifecycle
 
@@ -43,9 +51,18 @@ final class VideoEncoder {
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
 
-        VTCompressionSessionEncodeFrame(session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
-                                        duration: dur, frameProperties: frameProperties,
-                                        infoFlagsOut: &flags, outputHandler: nil)
+        let status = VTCompressionSessionEncodeFrame(
+            session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
+            duration: dur, frameProperties: frameProperties,
+            sourceFrameRefcon: nil, infoFlagsOut: &flags
+        )
+
+        if status != noErr {
+            let error = NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+            onError?(error)
+            recreateSession()
+        }
+
         frameCount += 1
     }
 
@@ -62,7 +79,24 @@ final class VideoEncoder {
 
     // MARK: - Private
 
+    private func recreateSession() {
+        encoderQueue.async { [weak self] in
+            guard let self else { return }
+            if let session = self.session {
+                VTCompressionSessionInvalidate(session)
+                self.session = nil
+            }
+            self.createSession(width: self.lastWidth, height: self.lastHeight,
+                               fps: self.lastFPS, bitrate: self.lastBitrate)
+        }
+    }
+
     private func createSession(width: Int32, height: Int32, fps: Int32, bitrate: Int) {
+        lastWidth = width
+        lastHeight = height
+        lastFPS = fps
+        lastBitrate = bitrate
+
         var s: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: nil,
@@ -78,6 +112,7 @@ final class VideoEncoder {
         )
         guard status == noErr, let s else {
             print("[VideoEncoder] Failed to create VTCompressionSession: \(status)")
+            onError?(NSError(domain: NSOSStatusErrorDomain, code: Int(status)))
             return
         }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime,          value: kCFBooleanTrue)
@@ -86,6 +121,9 @@ final class VideoEncoder {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate,    value: bitrate as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_H264EntropyMode,   value: kVTH264EntropyMode_CABAC)
+        // Set data rate limits: [bytes per second, period in seconds]
+        let dataRateLimit = [Double(bitrate) / 8.0 * 1.5, 1.0] as CFArray
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimit)
         VTCompressionSessionPrepareToEncodeFrames(s)
         self.session = s
     }
@@ -108,10 +146,16 @@ private func outputCallback(
     else { return }
 
     let encoder = Unmanaged<VideoEncoder>.fromOpaque(refCon).takeUnretainedValue()
-    let isKeyframe = !CFDictionaryContainsKey(
-        CMSampleBufferGetAttachments(sampleBuffer, attachmentMode: .shouldPropagate),
-        kCMSampleAttachmentKey_NotSync
-    )
+
+    // Detect keyframe by checking sample attachments
+    let isKeyframe: Bool
+    if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+       let first = attachments.first {
+        // If kCMSampleAttachmentKey_NotSync is absent or false, it's a keyframe
+        isKeyframe = !(first[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+    } else {
+        isKeyframe = true
+    }
 
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
     var totalLength = 0
@@ -122,6 +166,12 @@ private func outputCallback(
 
     // Convert AVCC (length-prefixed) to Annex B (start-code prefixed)
     var annexB = Data()
+
+    // Prepend SPS/PPS for keyframes
+    if isKeyframe, let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) {
+        annexB.append(annexBParameterSets(from: formatDesc))
+    }
+
     var offset = 0
     while offset < totalLength {
         // Read 4-byte AVCC length prefix (big-endian)
@@ -138,4 +188,29 @@ private func outputCallback(
     let ptsUs = Int64(CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1_000_000)
     let frame = VideoEncoder.EncodedFrame(data: annexB, ptsUs: ptsUs, isKeyframe: isKeyframe)
     encoder.onEncodedFrame?(frame)
+}
+
+/// Extract SPS and PPS from the format description and return as Annex B data.
+private func annexBParameterSets(from formatDescription: CMFormatDescription) -> Data {
+    var data = Data()
+    var paramSetCount = 0
+    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        formatDescription, parameterSetIndex: 0,
+        parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+        parameterSetCountOut: &paramSetCount, nalUnitHeaderLengthOut: nil
+    )
+    for i in 0..<paramSetCount {
+        var paramSetPtr: UnsafePointer<UInt8>?
+        var paramSetSize = 0
+        let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            formatDescription, parameterSetIndex: i,
+            parameterSetPointerOut: &paramSetPtr, parameterSetSizeOut: &paramSetSize,
+            parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
+        )
+        if status == noErr, let ptr = paramSetPtr {
+            data.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
+            data.append(ptr, count: paramSetSize)
+        }
+    }
+    return data
 }

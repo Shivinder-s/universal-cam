@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import Combine
+import UIKit
 
 /// Discovers Windows-side universal-cam instances on the LAN via Bonjour/mDNS.
 /// Also advertises the phone so the Windows app can find it (bidirectional discovery).
@@ -74,7 +75,6 @@ extension BonjourDiscovery: NetServiceDelegate {
 
     private func resolveIPv4(from data: Data) -> String? {
         data.withUnsafeBytes { ptr -> String? in
-            var storage = sockaddr_storage()
             let addr = ptr.baseAddress!.assumingMemoryBound(to: sockaddr.self)
             guard addr.pointee.sa_family == AF_INET else { return nil }
             var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))

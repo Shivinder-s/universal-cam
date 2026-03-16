@@ -9,57 +9,62 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // Full-screen camera preview
+            // Full-screen camera preview (blurred)
             CameraPreviewView(session: camera.captureSession)
                 .ignoresSafeArea()
-                .onAppear  { camera.start() }
+                .onAppear {
+                    camera.start()
+                    connection.startDiscovery()
+                }
                 .onDisappear { camera.stop() }
 
             // Status overlay
             VStack {
                 HStack {
+                    StatusPill(
+                        state: connection.state,
+                        latency: connection.latencyMs,
+                        transport: connection.activeTransport
+                    )
+                    .padding(.top, 56)
+                    .padding(.leading, 16)
                     Spacer()
-                    StatusPill(state: connection.state, latency: connection.latencyMs)
-                        .padding(.top, 56)
-                        .padding(.trailing, 16)
-                }
-                Spacer()
-
-                // Bottom controls
-                HStack(spacing: 24) {
-                    // Flip camera
-                    Button {
-                        camera.switchCamera()
-                    } label: {
-                        Image(systemName: "arrow.triangle.2.circlepath.camera")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.white)
-                    }
-
-                    // Stream toggle
-                    StreamToggleButton(state: connection.state) {
-                        switch connection.state {
-                        case .idle, .error:
-                            connection.startDiscovery()
-                        case .connected:
-                            connection.startStreaming()
-                        case .streaming:
-                            connection.stopStreaming()
-                        default:
-                            break
-                        }
-                    }
 
                     // Settings
                     Button {
                         showSettings = true
                     } label: {
-                        Image(systemName: "gearshape")
-                            .font(.system(size: 28))
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 22))
                             .foregroundStyle(.white)
+                            .padding(10)
+                            .background(.ultraThinMaterial, in: Circle())
                     }
+                    .padding(.top, 56)
+                    .padding(.trailing, 16)
                 }
-                .padding(.bottom, 48)
+
+                Spacer()
+
+                // Connection hint when idle
+                if case .idle = connection.state {
+                    Text("Waiting for PC connection...")
+                        .font(.callout)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .padding(.bottom, 48)
+                } else if case .discovering = connection.state {
+                    VStack(spacing: 4) {
+                        Text("Searching for PC on local network...")
+                            .font(.callout)
+                            .foregroundStyle(.white.opacity(0.7))
+                        if connection.usbListening {
+                            Text("Also listening for USB connection on port \(USBTransport.port)")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                    }
+                    .padding(.bottom, 48)
+                }
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -73,8 +78,9 @@ struct ContentView: View {
 // MARK: - Sub-views
 
 private struct StatusPill: View {
-    let state:   ConnectionManager.State
-    let latency: Int
+    let state:     ConnectionManager.State
+    let latency:   Int
+    let transport: ConnectionManager.TransportType?
 
     var body: some View {
         HStack(spacing: 6) {
@@ -84,6 +90,17 @@ private struct StatusPill: View {
             Text(stateLabel)
                 .font(.caption.bold())
                 .foregroundStyle(.white)
+            if let transport, state == .connected || state == .streaming {
+                Text(transport.rawValue)
+                    .font(.caption2.bold())
+                    .foregroundStyle(.white.opacity(0.8))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(
+                        transport == .usb ? Color.blue.opacity(0.6) : Color.purple.opacity(0.6),
+                        in: Capsule()
+                    )
+            }
             if state == .streaming, latency > 0 {
                 Text("\(latency)ms")
                     .font(.caption2)
@@ -118,30 +135,6 @@ private struct StatusPill: View {
     }
 }
 
-private struct StreamToggleButton: View {
-    let state:   ConnectionManager.State
-    let action:  () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            ZStack {
-                Circle()
-                    .fill(state == .streaming ? Color.red : Color.white)
-                    .frame(width: 72, height: 72)
-                if state == .streaming {
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(.white)
-                        .frame(width: 24, height: 24)
-                } else {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 56, height: 56)
-                }
-            }
-        }
-    }
-}
-
 private struct SettingsView: View {
     @EnvironmentObject var connection: ConnectionManager
     @EnvironmentObject var camera:     CameraSession
@@ -150,23 +143,78 @@ private struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Discovered Devices") {
-                    if connection.discoveredPeers.isEmpty {
-                        Text("Searching for Windows PC...")
-                            .foregroundStyle(.secondary)
+                Section("Connection") {
+                    if let transport = connection.activeTransport {
+                        HStack {
+                            Image(systemName: transport == .usb ? "cable.connector" : "wifi")
+                            Text("Connected via \(transport.rawValue)")
+                            Spacer()
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        }
+                    }
+
+                    if connection.discoveredPeers.isEmpty && connection.activeTransport != .wifi {
+                        HStack {
+                            ProgressView()
+                                .padding(.trailing, 8)
+                            Text("Searching for Windows PC...")
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
                         ForEach(connection.discoveredPeers, id: \.self) { peer in
-                            Button(peer) {
+                            Button {
                                 connection.connect(to: peer)
                                 dismiss()
+                            } label: {
+                                HStack {
+                                    Image(systemName: "desktopcomputer")
+                                    Text(peer)
+                                    Spacer()
+                                    if connection.peerHost == peer {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.green)
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                Section("Resolution") {
-                    // TODO: Wire to CameraSession.setResolution in Phase 2
-                    Text("1080p (default)")
-                        .foregroundStyle(.secondary)
+
+                Section("USB") {
+                    HStack {
+                        Image(systemName: "cable.connector")
+                        Text("USB Listener")
+                        Spacer()
+                        Text(connection.usbListening ? "Port \(USBTransport.port)" : "Inactive")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("Status") {
+                    HStack {
+                        Text("State")
+                        Spacer()
+                        Text(stateDescription)
+                            .foregroundStyle(.secondary)
+                    }
+                    if connection.latencyMs > 0 {
+                        HStack {
+                            Text("Latency")
+                            Spacer()
+                            Text("\(connection.latencyMs) ms")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if connection.state != .idle {
+                    Section {
+                        Button("Disconnect", role: .destructive) {
+                            connection.disconnect()
+                            dismiss()
+                        }
+                    }
                 }
             }
             .navigationTitle("Settings")
@@ -176,6 +224,17 @@ private struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+        }
+    }
+
+    private var stateDescription: String {
+        switch connection.state {
+        case .idle:              return "Not connected"
+        case .discovering:       return "Searching..."
+        case .connecting(let h): return "Connecting to \(h)"
+        case .connected:         return "Ready"
+        case .streaming:         return "Streaming"
+        case .error(let msg):    return msg
         }
     }
 }

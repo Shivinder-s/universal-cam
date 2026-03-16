@@ -59,6 +59,11 @@ Generated Files/
 *.g.cs
 *.g.i.cs
 
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
 # Windows
 Thumbs.db
 ehthumbs.db
@@ -69,6 +74,11 @@ $RECYCLE.BIN/
 # Office temp files (keep the actual docx)
 ~$*.docx
 ~$*.xlsx
+
+# AI tool settings
+.claude/
+.cursor/
+.aider*
 
 # Secrets / local config
 *.pfx

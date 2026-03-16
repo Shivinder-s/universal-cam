@@ -13,6 +13,14 @@ struct UniversalCamPhoneApp: App {
             ContentView()
                 .environmentObject(connectionManager)
                 .environmentObject(cameraSession)
+                .onAppear {
+                    // Wire video frames: Camera → ConnectionManager → Encoder → Transport
+                    cameraSession.onVideoSampleBuffer = { [weak connectionManager] sample in
+                        connectionManager?.handleVideoSample(sample)
+                    }
+                    // Give ConnectionManager access to camera for PC-initiated switching
+                    connectionManager.cameraSession = cameraSession
+                }
         }
     }
 }

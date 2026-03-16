@@ -21,7 +21,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             try session.setCategory(
                 .playAndRecord,
                 mode: .videoRecording,
-                options: [.allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
+                options: [.allowBluetoothA2DP, .mixWithOthers]
             )
             try session.setActive(true)
         } catch {
@@ -36,13 +36,11 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             forTaskWithIdentifier: "com.universalcam.phone.stream-keepalive",
             using: nil
         ) { task in
-            // TODO: Extend streaming keepalive in background (Phase 2)
             task.setTaskCompleted(success: true)
         }
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
         // AVCaptureSession continues running in background via UIBackgroundModes: audio + voip
-        // No explicit action needed; the session keeps the app alive.
     }
 }

@@ -2,12 +2,14 @@ import Network
 import Foundation
 
 /// Low-level QUIC transport using Network.framework NWConnection.
-/// Port 7779. Three logical streams multiplexed over one QUIC connection:
-///   Stream 0 — Control  (JSON, newline-delimited, bidirectional)
-///   Stream 1 — Video    (binary framed H.264 Annex B, phone → PC)
-///   Stream 2 — Audio    (binary framed AAC-LC, phone → PC)
+/// Port 7779. Three logical streams multiplexed over one QUIC connection
+/// using a 1-byte stream type prefix on each message:
+///   0x00 — Control  (JSON, newline-delimited, bidirectional)
+///   0x01 — Video    (binary framed H.264 Annex B, phone → PC)
+///   0x02 — Audio    (binary framed AAC-LC, phone → PC)
 ///
 /// Wire frame format for video/audio streams:
+///   [1 byte:  stream_type (0x01 or 0x02)]
 ///   [4 bytes: payload_length uint32 LE]
 ///   [8 bytes: pts_us int64 LE]
 ///   [1 byte:  flags]  video: bit0=keyframe, bit1=hevc; audio: channels (1 or 2)
@@ -19,6 +21,13 @@ final class QuicTransport {
     static let port: UInt16 = 7779
     static let serviceType  = "_universalcam._tcp"
 
+    /// Stream type identifiers for in-band multiplexing
+    private enum StreamType: UInt8 {
+        case control = 0x00
+        case video   = 0x01
+        case audio   = 0x02
+    }
+
     // MARK: - Callbacks
 
     var onControlMessage: ((Data) -> Void)?
@@ -29,6 +38,7 @@ final class QuicTransport {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.universalcam.quic", qos: .userInteractive)
     private var retryCount = 0
+    private static let maxRetries = 10
 
     // MARK: - Connection
 
@@ -42,6 +52,9 @@ final class QuicTransport {
         self.connection = conn
         conn.stateUpdateHandler = { [weak self] state in
             self?.onStateChange?(state)
+            if case .ready = state {
+                self?.retryCount = 0
+            }
             if case .failed = state { self?.scheduleReconnect(host: host, port: port) }
         }
         conn.start(queue: queue)
@@ -60,22 +73,23 @@ final class QuicTransport {
         guard let data = try? JSONEncoder().encode(message),
               let conn = connection
         else { return }
-        var payload = data
+        var payload = Data([StreamType.control.rawValue])
+        payload.append(data)
         payload.append(0x0A) // newline delimiter
         conn.send(content: payload, completion: .idempotent)
     }
 
     func sendVideoFrame(_ frame: VideoEncoder.EncodedFrame) {
         guard let conn = connection else { return }
-        var flags: UInt8 = frame.isKeyframe ? 0x01 : 0x00
-        let packet = makeFramePacket(payload: frame.data, ptsUs: frame.ptsUs, flags: flags)
+        let flags: UInt8 = frame.isKeyframe ? 0x01 : 0x00
+        let packet = makeFramePacket(streamType: .video, payload: frame.data, ptsUs: frame.ptsUs, flags: flags)
         conn.send(content: packet, completion: .idempotent)
     }
 
     func sendAudioFrame(_ frame: AudioCapture.AudioFrame) {
         guard let conn = connection else { return }
         let flags = UInt8(frame.channels)
-        let packet = makeFramePacket(payload: frame.data, ptsUs: frame.ptsUs, flags: flags)
+        let packet = makeFramePacket(streamType: .audio, payload: frame.data, ptsUs: frame.ptsUs, flags: flags)
         conn.send(content: packet, completion: .idempotent)
     }
 
@@ -84,7 +98,7 @@ final class QuicTransport {
     private func receiveLoop(_ conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             if let data, !data.isEmpty {
-                self?.onControlMessage?(data)
+                self?.demultiplex(data)
             }
             if !isComplete && error == nil {
                 self?.receiveLoop(conn)
@@ -92,25 +106,58 @@ final class QuicTransport {
         }
     }
 
+    /// Demultiplex received data based on the stream type prefix byte.
+    private func demultiplex(_ data: Data) {
+        guard let firstByte = data.first else { return }
+
+        if firstByte == StreamType.control.rawValue {
+            // Strip the stream type prefix and forward control data
+            let controlData = data.dropFirst()
+            if !controlData.isEmpty {
+                onControlMessage?(Data(controlData))
+            }
+        } else {
+            // From the PC side we only expect control messages;
+            // video/audio are phone→PC only. Forward as control for safety.
+            onControlMessage?(data)
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeQUICParameters() -> NWParameters {
-        // TODO: Replace with a real TLS certificate for production.
-        // For development, use a self-signed cert or disable peer verification.
         let tlsOptions = NWProtocolTLS.Options()
+
+        #if DEBUG
+        // Accept self-signed certificates in debug builds for local testing
         sec_protocol_options_set_verify_block(
             tlsOptions.securityProtocolOptions,
-            { _, _, completion in completion(true) },  // Accept any cert in dev builds
+            { _, _, completion in completion(true) },
             queue
         )
+        #else
+        // Validate certificates via system trust store in release builds
+        sec_protocol_options_set_verify_block(
+            tlsOptions.securityProtocolOptions,
+            { _, sec_trust, completion in
+                let trust = sec_trust_copy_ref(sec_trust).takeRetainedValue()
+                var error: CFError?
+                let isValid = SecTrustEvaluateWithError(trust, &error)
+                completion(isValid)
+            },
+            queue
+        )
+        #endif
+
         let quicOptions = NWProtocolQUIC.Options(alpn: ["universalcam/1"])
         let params = NWParameters(quic: quicOptions)
         return params
     }
 
-    /// Builds the binary frame header + payload.
-    private func makeFramePacket(payload: Data, ptsUs: Int64, flags: UInt8) -> Data {
+    /// Builds the binary frame: [stream_type][length][pts][flags][payload]
+    private func makeFramePacket(streamType: StreamType, payload: Data, ptsUs: Int64, flags: UInt8) -> Data {
         var packet = Data()
+        packet.append(streamType.rawValue)
         var length = UInt32(payload.count).littleEndian
         var pts    = ptsUs.littleEndian
         packet.append(contentsOf: withUnsafeBytes(of: &length) { Array($0) })
@@ -123,8 +170,13 @@ final class QuicTransport {
     // MARK: - Reconnect
 
     private func scheduleReconnect(host: String, port: UInt16) {
+        guard retryCount < Self.maxRetries else {
+            print("[QuicTransport] Max retries reached, giving up")
+            return
+        }
         let delay = min(pow(2.0, Double(retryCount)), 30.0)
         retryCount += 1
+        print("[QuicTransport] Reconnecting in \(delay)s (attempt \(retryCount)/\(Self.maxRetries))")
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.connect(to: host, port: port)
         }

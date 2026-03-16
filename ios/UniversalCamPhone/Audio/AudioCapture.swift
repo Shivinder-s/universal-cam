@@ -1,5 +1,5 @@
 import AVFoundation
-import Accelerate
+import AudioToolbox
 
 /// Captures microphone audio via AVAudioEngine and encodes to AAC-LC frames.
 final class AudioCapture {
@@ -7,7 +7,7 @@ final class AudioCapture {
     // MARK: - Types
 
     struct AudioFrame {
-        let data:     Data    // Raw AAC-LC frame
+        let data:     Data    // AAC-LC frame data
         let ptsUs:    Int64   // Presentation timestamp in microseconds
         let channels: Int     // 1 = mono, 2 = stereo
     }
@@ -18,10 +18,10 @@ final class AudioCapture {
 
     // MARK: - Private
 
-    private let engine        = AVAudioEngine()
-    private var converter:    AVAudioConverter?
-    private let outputFormat  = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                              sampleRate: 44100, channels: 2, interleaved: false)!
+    private let engine = AVAudioEngine()
+    private var aacConverter: AVAudioConverter?
+    private var sampleCount: Int64 = 0
+    private let sampleRate: Double = 44100
 
     // MARK: - Lifecycle
 
@@ -29,9 +29,37 @@ final class AudioCapture {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
 
-        // Install tap on input node — 1024 samples at native input format
+        // Create AAC output format
+        guard let aacFormat = AVAudioFormat(
+            settings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: sampleRate,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 128_000,
+                AVEncoderBitRateStrategyKey: AVAudioBitRateStrategy_Constant
+            ]
+        ) else {
+            print("[AudioCapture] Failed to create AAC format")
+            return
+        }
+
+        // Intermediate PCM format at target sample rate for conversion
+        guard let pcmFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 2,
+            interleaved: false
+        ) else {
+            print("[AudioCapture] Failed to create PCM format")
+            return
+        }
+
+        aacConverter = AVAudioConverter(from: pcmFormat, to: aacFormat)
+        sampleCount = 0
+
+        // Install tap on input node
         input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, time in
-            self?.process(buffer: buffer, time: time)
+            self?.process(buffer: buffer, time: time, targetPCMFormat: pcmFormat)
         }
 
         do {
@@ -44,28 +72,57 @@ final class AudioCapture {
     func stop() {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+        aacConverter = nil
+        sampleCount = 0
     }
 
     // MARK: - Processing
 
-    private func process(buffer: AVAudioPCMBuffer, time: AVAudioTime) {
-        // TODO: Encode PCM → AAC-LC using AVAudioConverter (Phase 2)
-        // For Phase 1 skeleton: pass raw PCM as placeholder until AAC encoding is wired up
-        guard let channelData = buffer.floatChannelData else { return }
-        let frameLength = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        var rawData = Data(count: frameLength * channelCount * MemoryLayout<Float>.size)
-        rawData.withUnsafeMutableBytes { ptr in
-            for ch in 0..<channelCount {
-                let src = channelData[ch]
-                let dst = ptr.baseAddress!.advanced(by: ch * frameLength * MemoryLayout<Float>.size)
-                memcpy(dst, src, frameLength * MemoryLayout<Float>.size)
+    private func process(buffer: AVAudioPCMBuffer, time: AVAudioTime, targetPCMFormat: AVAudioFormat) {
+        guard let converter = aacConverter else { return }
+
+        // Convert input buffer to the target PCM format if needed
+        let pcmBuffer: AVAudioPCMBuffer
+        if buffer.format == targetPCMFormat {
+            pcmBuffer = buffer
+        } else {
+            guard let formatConverter = AVAudioConverter(from: buffer.format, to: targetPCMFormat) else { return }
+            guard let converted = AVAudioPCMBuffer(pcmFormat: targetPCMFormat, frameCapacity: buffer.frameLength) else { return }
+            var error: NSError?
+            formatConverter.convert(to: converted, error: &error) { _, outStatus in
+                outStatus.pointee = .haveData
+                return buffer
             }
+            if error != nil { return }
+            pcmBuffer = converted
         }
-        let ptsUs = time.hostTime > 0
-            ? Int64(Double(time.hostTime) / Double(NSEC_PER_MSEC) * 1000)
-            : Int64(Date().timeIntervalSince1970 * 1_000_000)
-        let frame = AudioFrame(data: rawData, ptsUs: ptsUs, channels: channelCount)
+
+        // Encode PCM to AAC
+        guard let aacBuffer = AVAudioCompressedBuffer(
+            format: converter.outputFormat,
+            packetCapacity: 1,
+            maximumPacketSize: 768
+        ) as AVAudioCompressedBuffer? else { return }
+
+        var error: NSError?
+        converter.convert(to: aacBuffer, error: &error) { _, outStatus in
+            outStatus.pointee = .haveData
+            return pcmBuffer
+        }
+
+        if let error {
+            print("[AudioCapture] AAC encoding error: \(error)")
+            return
+        }
+
+        guard aacBuffer.byteLength > 0 else { return }
+
+        let data = Data(bytes: aacBuffer.data, count: Int(aacBuffer.byteLength))
+        let ptsUs = Int64(Double(sampleCount) / sampleRate * 1_000_000)
+        sampleCount += Int64(pcmBuffer.frameLength)
+
+        let channelCount = Int(converter.outputFormat.channelCount)
+        let frame = AudioFrame(data: data, ptsUs: ptsUs, channels: channelCount)
         onEncodedAudio?(frame)
     }
 }
