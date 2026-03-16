@@ -17,8 +17,6 @@ packages/
 *.suo
 *.userosscache
 *.sln.docstates
-.vscode/launch.json
-.vscode/tasks.json
 
 # .NET specific
 project.lock.json

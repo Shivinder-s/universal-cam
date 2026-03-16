@@ -2,7 +2,6 @@
   "recommendations": [
     "ms-dotnettools.csharp",
     "ms-dotnettools.csdevkit",
-    "microsoft-ui-xaml.xaml-language-server",
     "redhat.vscode-xml",
     "EditorConfig.EditorConfig",
     "aliasadidev.nugetpackagemanagergui",
