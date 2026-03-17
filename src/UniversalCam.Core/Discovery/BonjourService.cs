@@ -1,3 +1,4 @@
+using System.Net.NetworkInformation;
 using Makaretu.Dns;
 
 namespace UniversalCam.Core.Discovery;
@@ -20,8 +21,18 @@ public sealed class BonjourService : IAsyncDisposable
 
     public BonjourService()
     {
-        _mdns = new MulticastService();
-        _sd   = new ServiceDiscovery(_mdns);
+        // Only use active, non-loopback interfaces that support multicast.
+        // This prevents binding to virtual adapters, Hyper-V switches, etc.
+        // which can cause mDNS packets to be sent on the wrong interface.
+        _mdns = new MulticastService(ifaces =>
+            ifaces.Where(nic =>
+                nic.OperationalStatus == OperationalStatus.Up &&
+                nic.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                nic.NetworkInterfaceType != NetworkInterfaceType.Tunnel &&
+                nic.SupportsMulticast &&
+                nic.GetIPProperties().UnicastAddresses
+                    .Any(a => a.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)));
+        _sd = new ServiceDiscovery(_mdns);
     }
 
     /// <summary>
@@ -33,7 +44,7 @@ public sealed class BonjourService : IAsyncDisposable
 
         _profile = new ServiceProfile(
             System.Net.Dns.GetHostName(),
-            $"{ServiceType}.local.",
+            ServiceType,
             (ushort)AdvertisePort);
 
         _profile.AddProperty("version",  "1");

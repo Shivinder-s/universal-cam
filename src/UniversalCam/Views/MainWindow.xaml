@@ -16,7 +16,11 @@
             HorizontalAlignment="Stretch"
             VerticalAlignment="Stretch"
             Stretch="Uniform"
-            RenderOptions.BitmapScalingMode="NearestNeighbor" />
+            RenderOptions.BitmapScalingMode="HighQuality">
+            <Image.LayoutTransform>
+                <RotateTransform x:Name="imgRotation" Angle="0" />
+            </Image.LayoutTransform>
+        </Image>
 
         <!-- ── Placeholder shown when no stream is active ───────────── -->
         <StackPanel
@@ -82,14 +86,20 @@
                     </Border>
                 </StackPanel>
 
-                <!-- Centre: resolution / fps -->
-                <TextBlock
-                    x:Name="txtInfo"
-                    Grid.Column="1"
-                    FontSize="13"
-                    Foreground="#888"
-                    Margin="16,0"
-                    VerticalAlignment="Center" />
+                <!-- Centre: resolution / fps + PC IP -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0">
+                    <TextBlock
+                        x:Name="txtInfo"
+                        FontSize="13"
+                        Foreground="#888"
+                        VerticalAlignment="Center" />
+                    <TextBlock
+                        x:Name="txtIpHint"
+                        FontSize="12"
+                        Foreground="#666"
+                        VerticalAlignment="Center"
+                        Margin="12,0,0,0" />
+                </StackPanel>
 
                 <!-- Right: controls -->
                 <StackPanel
@@ -111,6 +121,11 @@
                         IsEnabled="False"
                         Margin="0,0,8,0"
                         Click="OnMuteClicked" />
+                    <Button
+                        x:Name="btnRotate"
+                        Content="Rotate"
+                        Margin="0,0,8,0"
+                        Click="OnRotateClicked" />
                     <Button
                         x:Name="btnFlip"
                         Content="Flip Camera"

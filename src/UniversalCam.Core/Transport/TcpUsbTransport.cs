@@ -1,20 +1,15 @@
 using System.Net;
 using System.Net.Sockets;
-using System.Text.Json;
 using UniversalCam.Core.Protocol;
 
 namespace UniversalCam.Core.Transport;
 
 /// <summary>
-/// TCP server for USB-tunnelled connections from the iPhone.
+/// TCP server transport — listens on port 7780 for incoming connections from the iPhone.
 ///
-/// When an iPhone is connected via USB, libimobiledevice / Apple Devices on Windows
-/// creates a TCP tunnel: any connection to 127.0.0.1:{port} is forwarded to
-/// port <see cref="Port"/> on the iPhone. Our iPhone app (USBTransport.swift) listens
-/// on that port, so we connect outbound to localhost to reach it.
-///
-/// However, the iPhone app acts as the TCP *listener* and the PC must *connect*.
-/// So we connect to 127.0.0.1:7780 (the libimobiledevice-forwarded port).
+/// Works both over USB (when Apple Mobile Device Service creates a virtual network
+/// adapter) and over plain Wi-Fi as a QUIC fallback.  The iPhone app connects to
+/// the PC's IP address on this port via its TCPTransport.
 ///
 /// Wire protocol is identical to QuicTransport — same frame layout, same control JSON.
 /// </summary>
@@ -28,6 +23,7 @@ public sealed class TcpUsbTransport : ITransport
 
     public TransportState State { get; private set; } = TransportState.Idle;
 
+    private TcpListener?      _listener;
     private TcpClient?        _client;
     private NetworkStream?    _stream;
     private readonly FrameParser _parser = new();
@@ -39,27 +35,29 @@ public sealed class TcpUsbTransport : ITransport
         _parser.FrameParsed          += (_, frame) => FrameReceived?.Invoke(this, frame);
     }
 
-    /// Attempt to connect to the iPhone via the USB tunnel (localhost proxy).
+    /// Start listening for incoming TCP connections on port 7780.
     public async Task ConnectAsync(CancellationToken ct = default)
     {
+        if (_listener is not null) return; // already listening
+
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
         try
         {
-            SetState(TransportState.Listening); // "Listening" = waiting for USB plug-in / trying to connect
-            _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _listener = new TcpListener(IPAddress.Any, Port);
+            _listener.Start();
+            SetState(TransportState.Listening);
+            Console.WriteLine($"[TcpUsbTransport] Listening on TCP port {Port}");
 
-            _client = new TcpClient();
-            await _client.ConnectAsync(IPAddress.Loopback, Port, _cts.Token);
-            _stream = _client.GetStream();
-
-            SetState(TransportState.Connected);
-            _ = ReceiveLoopAsync(_cts.Token);
+            _ = AcceptLoopAsync(_cts.Token);
         }
-        catch (OperationCanceledException) { SetState(TransportState.Idle); }
         catch (Exception ex)
         {
-            Console.WriteLine($"[TcpUsbTransport] Connect failed: {ex.Message}");
+            Console.WriteLine($"[TcpUsbTransport] Failed to start listener: {ex.Message}");
             SetState(TransportState.Error);
         }
+
+        await Task.CompletedTask;
     }
 
     public async Task SendControlAsync(ControlMessage message, CancellationToken ct = default)
@@ -68,7 +66,6 @@ public sealed class TcpUsbTransport : ITransport
         try
         {
             var json = message.ToJsonBytes();
-            // Prefix with stream type 0x00, suffix with newline
             var packet = new byte[json.Length + 2];
             packet[0] = FrameHeader.StreamTypeControl;
             json.CopyTo(packet, 1);
@@ -82,14 +79,45 @@ public sealed class TcpUsbTransport : ITransport
         }
     }
 
-    private async Task ReceiveLoopAsync(CancellationToken ct)
+    private async Task AcceptLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && _listener is not null)
+        {
+            try
+            {
+                var client = await _listener.AcceptTcpClientAsync(ct);
+                Console.WriteLine($"[TcpUsbTransport] iPhone connected: {client.Client.RemoteEndPoint}");
+
+                // Drop existing connection if any
+                _client?.Close();
+                _stream?.Dispose();
+
+                _client = client;
+                _stream = client.GetStream();
+                SetState(TransportState.Connected);
+                _parser.Reset();
+
+                // Initiate handshake: iOS waits for welcome before sending hello
+                _ = SendControlAsync(new Welcome());
+
+                _ = ReceiveLoopAsync(_stream, _cts!.Token);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                Console.WriteLine($"[TcpUsbTransport] Accept error: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task ReceiveLoopAsync(NetworkStream stream, CancellationToken ct)
     {
         var buffer = new byte[65536];
         try
         {
-            while (!ct.IsCancellationRequested && _stream is not null)
+            while (!ct.IsCancellationRequested)
             {
-                var read = await _stream.ReadAsync(buffer, ct);
+                var read = await stream.ReadAsync(buffer, ct);
                 if (read == 0) break;
                 _parser.Feed(buffer.AsSpan(0, read));
             }
@@ -101,8 +129,12 @@ public sealed class TcpUsbTransport : ITransport
         }
         finally
         {
-            SetState(TransportState.Disconnected);
-            _parser.Reset();
+            if (_stream == stream) // only update state if this is still the active stream
+            {
+                SetState(TransportState.Disconnected);
+                _parser.Reset();
+                Console.WriteLine("[TcpUsbTransport] iPhone disconnected — still listening for reconnect");
+            }
         }
     }
 
@@ -116,7 +148,8 @@ public sealed class TcpUsbTransport : ITransport
     {
         _cts?.Cancel();
         _stream?.Dispose();
-        _client?.Dispose();
+        _client?.Close();
+        _listener?.Stop();
         await Task.CompletedTask;
     }
 }

@@ -1,12 +1,10 @@
 import Network
 import Foundation
 
-/// TCP-based transport for USB connections.
+/// TCP client transport — connects to the Windows app's TCP server on port 7780.
 ///
-/// When an iPhone is connected to a PC via USB cable, the PC-side app uses
-/// a USB multiplexing tool (e.g. usbmuxd / libimobiledevice) to create a
-/// TCP tunnel from a local PC port to a port on the iPhone.  From our side
-/// we simply listen on a TCP port and accept the incoming connection.
+/// Used as a reliable TCP fallback when QUIC is unavailable or slow to connect.
+/// Works over both Wi-Fi and USB (when Apple's USB network adapter is active).
 ///
 /// Uses the same wire framing as QuicTransport:
 ///   [1 byte:  stream_type]
@@ -20,7 +18,7 @@ final class USBTransport {
 
     // MARK: - Constants
 
-    /// TCP port the phone listens on for USB-tunnelled connections from the PC.
+    /// TCP port the Windows app listens on for TCP connections from the iPhone.
     static let port: UInt16 = 7780
 
     /// Stream type identifiers (mirrors QuicTransport)
@@ -39,7 +37,7 @@ final class USBTransport {
     var onStateChange:    ((USBConnectionState) -> Void)?
 
     enum USBConnectionState: Equatable {
-        case listening
+        case listening   // kept for API compat — means "ready / connecting"
         case connected
         case disconnected
         case failed(String)
@@ -47,10 +45,8 @@ final class USBTransport {
 
     // MARK: - Private (accessed on `queue`)
 
-    private var listener: NWListener?
     private var connection: NWConnection?
-    private let queue = DispatchQueue(label: "com.universalcam.usb", qos: .userInteractive)
-    private var isListening = false
+    private let queue = DispatchQueue(label: "com.universalcam.tcp", qos: .userInteractive)
 
     /// Accumulation buffer for reassembling TCP segments into complete messages.
     private var receiveBuffer = Data()
@@ -59,117 +55,70 @@ final class USBTransport {
     private var sendsInFlight = 0
     private static let maxSendsInFlight = 30
 
-    // MARK: - Listener
+    // MARK: - Connection
 
-    /// Start listening for incoming TCP connections on the USB port.
-    func startListening() {
+    /// Connect to the Windows app TCP server at the given host on port 7780.
+    func connect(to host: String) {
         queue.async { [self] in
-            guard !isListening else { return }
+            connection?.cancel()
+            receiveBuffer = Data()
+            sendsInFlight = 0
 
-            let tcpOptions = NWProtocolTCP.Options()
-            tcpOptions.noDelay = true
+            let endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: Self.port)!
+            )
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
 
-            let params = NWParameters(tls: nil, tcp: tcpOptions)
+            let conn = NWConnection(to: endpoint, using: params)
+            self.connection = conn
 
-            do {
-                let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.port)!)
-                self.listener = listener
-
-                listener.stateUpdateHandler = { [weak self] state in
-                    switch state {
-                    case .ready:
-                        self?.isListening = true
-                        self?.onStateChange?(.listening)
-                        print("[USBTransport] Listening on TCP port \(Self.port)")
-                    case .failed(let error):
-                        self?.isListening = false
-                        self?.onStateChange?(.failed(error.localizedDescription))
-                        print("[USBTransport] Listener failed: \(error)")
-                    case .cancelled:
-                        self?.isListening = false
-                        print("[USBTransport] Listener cancelled")
-                    default:
-                        break
-                    }
+            conn.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .ready:
+                    self?.onStateChange?(.connected)
+                    print("[USBTransport] Connected to PC at \(host):\(Self.port)")
+                case .failed(let error):
+                    self?.connection = nil
+                    self?.receiveBuffer = Data()
+                    self?.onStateChange?(.failed(error.localizedDescription))
+                    print("[USBTransport] Connection failed: \(error)")
+                case .cancelled:
+                    self?.connection = nil
+                    self?.receiveBuffer = Data()
+                    self?.onStateChange?(.disconnected)
+                default:
+                    break
                 }
-
-                listener.newConnectionHandler = { [weak self] newConnection in
-                    self?.handleNewConnection(newConnection)
-                }
-
-                listener.start(queue: queue)
-            } catch {
-                print("[USBTransport] Failed to create listener: \(error)")
-                onStateChange?(.failed(error.localizedDescription))
             }
+
+            conn.start(queue: queue)
+            onStateChange?(.listening)
+            receiveLoop(conn)
         }
     }
 
-    /// Stop listening and disconnect any active connection.
+    /// Legacy API — kept so ConnectionManager doesn't need changes
+    func startListening() {
+        // No-op: connection is initiated by connect(to:) when PC IP is known
+    }
+
     func stopListening() {
-        queue.async { [self] in
-            disconnectInternal()
-            listener?.cancel()
-            listener = nil
-            isListening = false
-        }
+        disconnect()
     }
 
-    /// Disconnect the current USB connection (but keep listening).
     func disconnect() {
         queue.async { [self] in
-            disconnectInternal()
+            connection?.cancel()
+            connection = nil
+            receiveBuffer = Data()
+            sendsInFlight = 0
+            onStateChange?(.disconnected)
         }
     }
 
-    /// Must be called on `queue`.
-    private func disconnectInternal() {
-        connection?.cancel()
-        connection = nil
-        receiveBuffer = Data()
-        sendsInFlight = 0
-        onStateChange?(.disconnected)
-    }
-
-    // MARK: - Connection Handling
-
-    /// Must be called on `queue`.
-    private func handleNewConnection(_ newConnection: NWConnection) {
-        if connection != nil {
-            print("[USBTransport] Rejecting additional connection — already connected")
-            newConnection.cancel()
-            return
-        }
-
-        connection = newConnection
-        receiveBuffer = Data()
-        sendsInFlight = 0
-
-        newConnection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                self?.onStateChange?(.connected)
-                print("[USBTransport] PC connected via USB")
-            case .failed(let error):
-                print("[USBTransport] Connection failed: \(error)")
-                self?.connection = nil
-                self?.receiveBuffer = Data()
-                self?.sendsInFlight = 0
-                self?.onStateChange?(.disconnected)
-            case .cancelled:
-                self?.connection = nil
-                self?.receiveBuffer = Data()
-                self?.sendsInFlight = 0
-                self?.onStateChange?(.disconnected)
-                print("[USBTransport] PC disconnected (USB)")
-            default:
-                break
-            }
-        }
-
-        newConnection.start(queue: queue)
-        receiveLoop(newConnection)
-    }
+    var isConnected: Bool { connection != nil }
 
     // MARK: - Send
 
@@ -204,7 +153,6 @@ final class USBTransport {
         }
     }
 
-    /// Send data with backpressure tracking. Must be called on `queue`.
     private func sendWithFlowControl(_ conn: NWConnection, data: Data) {
         sendsInFlight += 1
         conn.send(content: data, completion: .contentProcessed { [weak self] error in
@@ -214,11 +162,6 @@ final class USBTransport {
                 print("[USBTransport] Send error: \(error)")
             }
         })
-    }
-
-    /// Whether there is an active USB connection.
-    var isConnected: Bool {
-        connection != nil
     }
 
     // MARK: - Receive Loop with Reassembly
@@ -236,7 +179,6 @@ final class USBTransport {
         }
     }
 
-    /// Consume complete messages from the receive buffer.
     private func processReceiveBuffer() {
         while !receiveBuffer.isEmpty {
             guard let firstByte = receiveBuffer.first else { break }

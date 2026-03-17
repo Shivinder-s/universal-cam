@@ -30,6 +30,7 @@ public sealed class QuicServer : ITransport
 
     private QuicListener?   _listener;
     private QuicConnection? _connection;
+    private QuicStream?     _controlStream; // persistent PC→iPhone unidirectional stream
     private readonly FrameParser _parser = new();
     private CancellationTokenSource? _cts;
 
@@ -78,16 +79,15 @@ public sealed class QuicServer : ITransport
 
     public async Task SendControlAsync(ControlMessage message, CancellationToken ct = default)
     {
-        if (_connection is null) return;
+        if (_controlStream is null) return;
         try
         {
-            await using var stream = await _connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, ct);
             var json = message.ToJsonBytes();
             var packet = new byte[json.Length + 2];
             packet[0] = FrameHeader.StreamTypeControl;
             json.CopyTo(packet, 1);
             packet[^1] = 0x0A;
-            await stream.WriteAsync(packet, ct);
+            await _controlStream.WriteAsync(packet, ct);
         }
         catch (Exception ex)
         {
@@ -106,10 +106,29 @@ public sealed class QuicServer : ITransport
                 var connection = await _listener.AcceptConnectionAsync(ct);
                 Console.WriteLine($"[QuicServer] iPhone connected: {connection.RemoteEndPoint}");
 
-                // Only one connection at a time
+                // Only one connection at a time — close old control stream + connection
+                _controlStream?.DisposeAsync().AsTask().Forget();
+                _controlStream = null;
                 _connection?.CloseAsync(0).AsTask().Forget();
                 _connection = connection;
+
+                // Open persistent unidirectional stream for all PC→iPhone control messages.
+                // iOS advertises initialMaxStreamsUnidirectional=100, so this succeeds immediately.
+                try
+                {
+                    _controlStream = await connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, ct);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[QuicServer] Failed to open control stream: {ex.Message}");
+                    SetState(TransportState.Error);
+                    continue;
+                }
+
                 SetState(TransportState.Connected);
+
+                // Initiate handshake: iOS waits for welcome before sending hello
+                _ = SendControlAsync(new Welcome());
 
                 _ = ReadStreamsAsync(connection, ct);
             }
@@ -195,8 +214,9 @@ public sealed class QuicServer : ITransport
     public async ValueTask DisposeAsync()
     {
         _cts?.Cancel();
-        if (_connection is not null) await _connection.CloseAsync(0);
-        if (_listener  is not null) await _listener.DisposeAsync();
+        if (_controlStream is not null) await _controlStream.DisposeAsync();
+        if (_connection    is not null) await _connection.CloseAsync(0);
+        if (_listener      is not null) await _listener.DisposeAsync();
     }
 }
 

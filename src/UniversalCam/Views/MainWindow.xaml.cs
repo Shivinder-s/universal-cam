@@ -1,3 +1,5 @@
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
@@ -22,6 +24,7 @@ public partial class MainWindow : Window
     private int              _frameWidth;
     private int              _frameHeight;
     private WriteableBitmap? _bitmap;
+    private int              _rotation; // 0 / 90 / 180 / 270
 
     private readonly DispatcherTimer _vuTimer = new()
         { Interval = TimeSpan.FromMilliseconds(100) };
@@ -60,6 +63,7 @@ public partial class MainWindow : Window
         _cm.FrameReceived   += OnMediaFrame;
         _cm.CamerasReceived += OnCamerasReceived;
 
+        txtIpHint.Text = GetLocalIpHint();
         UpdateStatus(TransportState.Idle, TransportType.None);
 
         try
@@ -164,9 +168,15 @@ public partial class MainWindow : Window
             }
 
             _bitmap.Lock();
-            Marshal.Copy(frame.Data, 0, _bitmap.BackBuffer, frame.Data.Length);
-            _bitmap.AddDirtyRect(new System.Windows.Int32Rect(0, 0, frame.Width, frame.Height));
-            _bitmap.Unlock();
+            try
+            {
+                Marshal.Copy(frame.Data, 0, _bitmap.BackBuffer, frame.Data.Length);
+                _bitmap.AddDirtyRect(new System.Windows.Int32Rect(0, 0, frame.Width, frame.Height));
+            }
+            finally
+            {
+                _bitmap.Unlock();
+            }
         });
     }
 
@@ -176,6 +186,12 @@ public partial class MainWindow : Window
     {
         if (_cm is null) return;
         await _cm.ListCamerasAsync();
+    }
+
+    private void OnRotateClicked(object sender, RoutedEventArgs e)
+    {
+        _rotation = (_rotation + 90) % 360;
+        imgRotation.Angle = _rotation;
     }
 
     private async void OnStopClicked(object sender, RoutedEventArgs e)
@@ -196,7 +212,24 @@ public partial class MainWindow : Window
     private async Task SendConfigureAndStartAsync()
     {
         if (_cm is null) return;
-        await _cm.ConfigureAsync("1080p", 30, "h264", 8_000_000);
+        await _cm.ConfigureAsync("1920x1080", 30, "h264", 8_000_000);
+    }
+
+    private static string GetLocalIpHint()
+    {
+        try
+        {
+            var ip = NetworkInterface.GetAllNetworkInterfaces()
+                .Where(n => n.OperationalStatus == OperationalStatus.Up &&
+                            n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                            n.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                .SelectMany(n => n.GetIPProperties().UnicastAddresses)
+                .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork)
+                .Select(a => a.Address.ToString())
+                .FirstOrDefault();
+            return ip is null ? string.Empty : $"PC: {ip}:7779";
+        }
+        catch { return string.Empty; }
     }
 
     private void UpdateStatus(TransportState state, TransportType type)

@@ -66,8 +66,6 @@ final class ConnectionManager: ObservableObject {
         }() else { return }
         state = .discovering
         discovery.start()
-        // Also start USB listener so the PC can connect via cable
-        usbTransport.startListening()
     }
 
     /// Connect to a discovered Bonjour service endpoint.
@@ -75,16 +73,21 @@ final class ConnectionManager: ObservableObject {
         let displayName = Self.displayName(for: endpoint)
         state = .connecting(host: displayName)
         peerHost = displayName
-        activeTransport = .wifi
+        // Try QUIC (WiFi) and TCP (USB/fallback) simultaneously; first welcome wins
         wifiTransport.connect(to: endpoint)
+        if case .service(let name, _, _, _) = endpoint {
+            // For Bonjour endpoints we don't have a raw IP yet; TCP will connect after welcome
+            _ = name
+        }
     }
 
     /// Connect to a specific host/port (for manual IP entry).
     func connect(to host: String, port: UInt16 = 7779) {
         state = .connecting(host: host)
         peerHost = host
-        activeTransport = .wifi
+        // Try QUIC on 7779 and TCP on 7780 simultaneously; first welcome wins
         wifiTransport.connect(to: host, port: port)
+        usbTransport.connect(to: host)
     }
 
     func disconnect() {

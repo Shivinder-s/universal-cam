@@ -66,8 +66,8 @@ public sealed class ConnectionManager : IAsyncDisposable
         // Advertise on mDNS so iPhone BonjourDiscovery.swift can find us
         _bonjour.Start();
 
-        // Attempt USB connection in background — retries automatically
-        _ = UsbRetryLoopAsync(_cts.Token);
+        // Start TCP listener for USB/TCP fallback connections from iPhone
+        await _usb.ConnectAsync(_cts.Token);
 
         SetState(TransportState.Listening);
     }
@@ -176,9 +176,6 @@ public sealed class ConnectionManager : IAsyncDisposable
                     ActiveTransport = type;
                     SetState(TransportState.Connected);
                 }
-
-                // Reply with welcome
-                _ = transport.SendControlAsync(new Welcome());
                 break;
 
             case ConfigureAck ack:
@@ -195,24 +192,11 @@ public sealed class ConnectionManager : IAsyncDisposable
                 var rtt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - pong.Ts;
                 Console.WriteLine($"  RTT: {rtt} ms");
                 break;
-        }
-    }
 
-    /// Retry USB connection in the background whenever it disconnects.
-    private async Task UsbRetryLoopAsync(CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            if (_usb.State == TransportState.Idle ||
-                _usb.State == TransportState.Disconnected ||
-                _usb.State == TransportState.Error)
-            {
-                await _usb.ConnectAsync(ct);
-            }
-
-            // Wait before retry; keep interval short so we notice USB plug-in quickly
-            try { await Task.Delay(TimeSpan.FromSeconds(3), ct); }
-            catch (OperationCanceledException) { break; }
+            case Ping ping:
+                // Respond so iOS can measure its round-trip latency
+                _ = transport.SendControlAsync(new Pong { Ts = ping.Ts });
+                break;
         }
     }
 

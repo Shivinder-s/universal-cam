@@ -78,7 +78,7 @@ struct ContentView: View {
                                 .font(.callout)
                                 .foregroundStyle(.white.opacity(0.7))
                             if connection.usbListening {
-                                Text("Also listening for USB connection on port \(USBTransport.port)")
+                                Text("TCP fallback ready on port \(USBTransport.port)")
                                     .font(.caption)
                                     .foregroundStyle(.white.opacity(0.5))
                             }
@@ -217,6 +217,8 @@ private struct SettingsView: View {
     @EnvironmentObject var camera:     CameraSession
     @Environment(\.dismiss) var dismiss
 
+    @State private var manualIP = ""
+
     var body: some View {
         NavigationStack {
             Form {
@@ -259,12 +261,31 @@ private struct SettingsView: View {
                     }
                 }
 
-                Section("USB") {
+                Section("Manual Connect") {
+                    HStack {
+                        TextField("PC IP address (e.g. 192.168.1.5)", text: $manualIP)
+                            .keyboardType(.decimalPad)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                        if !manualIP.isEmpty {
+                            Button("Connect") {
+                                connection.connect(to: manualIP, port: 7779)
+                                dismiss()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    Text("Enter the IP shown in the Windows app (e.g. PC: 192.168.1.5:7779)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("TCP Fallback") {
                     HStack {
                         Image(systemName: "cable.connector")
-                        Text("USB Listener")
+                        Text("TCP port \(USBTransport.port)")
                         Spacer()
-                        Text(connection.usbListening ? "Port \(USBTransport.port)" : "Inactive")
+                        Text("Connects on manual IP")
                             .foregroundStyle(.secondary)
                     }
                 }

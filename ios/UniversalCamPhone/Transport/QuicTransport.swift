@@ -166,7 +166,10 @@ final class QuicTransport {
                 self?.receiveBuffer.append(data)
                 self?.processReceiveBuffer()
             }
-            if isComplete || error != nil {
+            // isComplete means the current QUIC stream ended (FIN), but the connection
+            // is still alive and the server may open additional streams. Stop only on error.
+            if let error {
+                print("[QuicTransport] Receive error: \(error)")
                 return
             }
             self?.receiveLoop(conn)
@@ -220,6 +223,10 @@ final class QuicTransport {
 
     private func makeQUICParameters() -> NWParameters {
         let quicOptions = NWProtocolQUIC.Options(alpn: ["universalcam/1"])
+
+        // Allow the PC (server) to open unidirectional streams for control messages.
+        // Default is 0, which blocks server-initiated streams entirely.
+        quicOptions.initialMaxStreamsUnidirectional = 100
 
         // Configure TLS on the QUIC options directly
         let secOptions = quicOptions.securityProtocolOptions
