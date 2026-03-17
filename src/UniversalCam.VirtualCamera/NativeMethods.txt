@@ -1,0 +1,21 @@
+# CsWin32 manifest for Media Foundation virtual camera APIs
+# This file declares which Windows APIs to generate P/Invoke wrappers for
+
+MFCreateVirtualCamera
+MFCreateMediaType
+MFCreateSample
+MFCreateMemoryBuffer
+MFGetAttributeAsUINT32
+MFSetAttributeUINT32
+MFGetAttributeAsIUnknown
+MFSetAttributeIUnknown
+MFInitMediaTypeFromWaveFormatEx
+IMFVirtualCamera
+IMFMediaSource
+IMFMediaStream
+IMFMediaEventGenerator
+IMFMediaEvent
+IMFMediaType
+IMFSample
+IMFMediaBuffer
+IMFAttributes

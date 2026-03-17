@@ -111,6 +111,10 @@ public sealed class VirtualCameraSession : IDisposable
             _currentWidth = frame.Width;
             _currentHeight = frame.Height;
             Console.WriteLine($"[VirtualCamera] Resolution changed to {_currentWidth}×{_currentHeight}");
+
+            // Notify servers of media type change
+            (_server as MfVirtualCameraServer)?.UpdateMediaType(_currentWidth, _currentHeight, 30);
+            (_server as DsVirtualCameraServer)?.UpdateMediaType(_currentWidth, _currentHeight, 30);
         }
 
         // Convert BGRA32 to NV12 and enqueue
@@ -201,4 +205,5 @@ public sealed class VirtualCameraSession : IDisposable
 /// </summary>
 internal interface IVirtualCameraServer : IDisposable
 {
+    void UpdateMediaType(int width, int height, long fps);
 }
