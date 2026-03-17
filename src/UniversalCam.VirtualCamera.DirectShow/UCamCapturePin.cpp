@@ -1,6 +1,17 @@
 #include "pch.h"
 #include "UCamCapturePin.h"
 
+// Frame header structure matching C# SharedMemoryBridge
+struct FrameHeader
+{
+    DWORD width;
+    DWORD height;
+    DWORD stride;
+    DWORD dataSize;
+    DWORD sequenceNo;
+    LONGLONG ptsUs;
+};
+
 const AMOVIESETUP_MEDIATYPE sudOpPinTypes =
     {
         &MEDIATYPE_Video,  // GUID of the media type
@@ -31,12 +42,16 @@ UCamCapturePin::UCamCapturePin(HRESULT *phr, CSource *pFilter)
     // Set frame rate: 30fps
     vih.AvgTimePerFrame = (LONGLONG)(10000000.0 / DEFAULT_FPS);
 
+    InitializeCriticalSection(&m_mmfMutex);
+
     if (FAILED(*phr))
         return;
 }
 
 UCamCapturePin::~UCamCapturePin()
 {
+    CleanupMemoryMappedFile();
+    DeleteCriticalSection(&m_mmfMutex);
 }
 
 HRESULT UCamCapturePin::CheckMediaType(const CMediaType *pMediaType)
@@ -118,9 +133,6 @@ HRESULT UCamCapturePin::FillBuffer(IMediaSample *pms)
 {
     ASSERT(pms);
 
-    // TODO: Read frame from SharedMemoryBridge (UniversalCam_VCam_Frame MMF)
-    // For now, fill with black (placeholder)
-
     BYTE *pData = NULL;
     long cbData = pms->GetSize();
 
@@ -128,12 +140,16 @@ HRESULT UCamCapturePin::FillBuffer(IMediaSample *pms)
     if (FAILED(hr))
         return hr;
 
-    // Fill with black (Y=0, U=128, V=128)
-    ZeroMemory(pData, cbData);
+    // Attempt to read from SharedMemoryBridge
+    if (TryReadFromMMF(pData, cbData, pms))
+    {
+        return S_OK;
+    }
 
-    // UV plane (starts at Y plane size)
+    // Fallback: Fill with black (Y=0, U=128, V=128) if MMF unavailable
+    ZeroMemory(pData, cbData);
     int ySize = m_videoInfo.bmiHeader.biWidth * m_videoInfo.bmiHeader.biHeight;
-    FillMemory(pData + ySize, cbData - ySize, 0x80); // U and V = 128
+    FillMemory(pData + ySize, cbData - ySize, 0x80);
 
     pms->SetActualDataLength(cbData);
 
@@ -143,12 +159,112 @@ HRESULT UCamCapturePin::FillBuffer(IMediaSample *pms)
 
     pms->SetTime(&rtStart, &rtStop);
     m_rtLastSampleTime = rtStop;
-
-    // Increment frame count
     m_dwFrameCount++;
-
-    // Mark keyframe
     pms->SetSyncPoint(TRUE);
 
     return S_OK;
+}
+
+BOOL UCamCapturePin::TryReadFromMMF(BYTE *pData, long cbData, IMediaSample *pms)
+{
+    EnterCriticalSection(&m_mmfMutex);
+
+    BOOL bSuccess = FALSE;
+    try
+    {
+        // Lazy-initialize MMF mapping on first call
+        if (m_hMapFile == NULL)
+        {
+            m_hMapFile = OpenFileMappingW(FILE_MAP_READ, FALSE, L"UniversalCam_VCam_Frame");
+            if (m_hMapFile == NULL)
+            {
+                // MMF not yet created; C# app may not be running
+                goto cleanup;
+            }
+
+            m_pMapView = (BYTE *)MapViewOfFile(m_hMapFile, FILE_MAP_READ, 0, 0, 0);
+            if (m_pMapView == NULL)
+            {
+                OutputDebugStringW(L"[UCamCapturePin] MapViewOfFile failed\r\n");
+                goto cleanup;
+            }
+        }
+
+        // Read frame header
+        FrameHeader *pHeader = (FrameHeader *)m_pMapView;
+
+        // Validate header
+        if (pHeader->width == 0 || pHeader->height == 0 || pHeader->dataSize == 0)
+        {
+            goto cleanup; // Invalid frame; use black placeholder
+        }
+
+        int expectedSize = pHeader->width * pHeader->height * 3 / 2;
+        if (pHeader->dataSize != expectedSize)
+        {
+            goto cleanup; // Size mismatch; use black placeholder
+        }
+
+        if ((int)pHeader->dataSize > cbData)
+        {
+            goto cleanup; // Frame too large for buffer
+        }
+
+        // Copy NV12 frame data
+        const BYTE *pFrameData = m_pMapView + sizeof(FrameHeader);
+        CopyMemory(pData, pFrameData, pHeader->dataSize);
+        pms->SetActualDataLength(pHeader->dataSize);
+
+        // Translate PTS: C# uses microseconds, DirectShow uses 100ns units
+        LONGLONG rtStart = pHeader->ptsUs * 10;
+        LONGLONG rtStop = rtStart + m_videoInfo.AvgTimePerFrame;
+
+        pms->SetTime(&rtStart, &rtStop);
+        m_rtLastSampleTime = rtStop;
+
+        // Update resolution if changed
+        if ((int)pHeader->width != m_videoInfo.bmiHeader.biWidth ||
+            (int)pHeader->height != m_videoInfo.bmiHeader.biHeight)
+        {
+            // Note: In production, would need to signal pin reconnection to change format
+            // For now, just update the cached values
+            if (pHeader->dataSize == (DWORD)(pHeader->width * pHeader->height * 3 / 2))
+            {
+                m_videoInfo.bmiHeader.biWidth = pHeader->width;
+                m_videoInfo.bmiHeader.biHeight = pHeader->height;
+                m_videoInfo.bmiHeader.biSizeImage = pHeader->dataSize;
+            }
+        }
+
+        m_dwFrameCount++;
+        pms->SetSyncPoint(TRUE);
+        bSuccess = TRUE;
+    }
+    catch (...)
+    {
+        OutputDebugStringW(L"[UCamCapturePin] Exception in TryReadFromMMF\r\n");
+    }
+
+cleanup:
+    LeaveCriticalSection(&m_mmfMutex);
+    return bSuccess;
+}
+
+void UCamCapturePin::CleanupMemoryMappedFile()
+{
+    EnterCriticalSection(&m_mmfMutex);
+
+    if (m_pMapView != NULL)
+    {
+        UnmapViewOfFile(m_pMapView);
+        m_pMapView = NULL;
+    }
+
+    if (m_hMapFile != NULL)
+    {
+        CloseHandle(m_hMapFile);
+        m_hMapFile = NULL;
+    }
+
+    LeaveCriticalSection(&m_mmfMutex);
 }

@@ -27,4 +27,12 @@ private:
     VIDEOINFOHEADER m_videoInfo;
     LONGLONG m_rtLastSampleTime;
     DWORD m_dwFrameCount;
+
+    // SharedMemoryBridge integration
+    HANDLE m_hMapFile = NULL;
+    BYTE *m_pMapView = NULL;
+    CRITICAL_SECTION m_mmfMutex;
+
+    BOOL TryReadFromMMF(BYTE *pData, long cbData, IMediaSample *pms);
+    void CleanupMemoryMappedFile();
 };
