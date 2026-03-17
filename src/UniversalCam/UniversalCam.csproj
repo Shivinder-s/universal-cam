@@ -16,7 +16,13 @@
 
         <!-- Per-monitor DPI awareness -->
         <ApplicationManifest>app.manifest</ApplicationManifest>
+        <ApplicationIcon>universal_cam.ico</ApplicationIcon>
     </PropertyGroup>
+
+    <ItemGroup>
+        <Resource Include="universal_cam.ico" />
+        <Resource Include="Assets\wordmark.png" />
+    </ItemGroup>
 
     <ItemGroup>
         <ProjectReference Include="..\UniversalCam.Core\UniversalCam.Core.csproj" />

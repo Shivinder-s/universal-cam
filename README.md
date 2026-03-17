@@ -27,6 +27,15 @@ Core transport/protocol implementation currently lives in `src/UniversalCam.Core
 - Basic Windows preview window with connection state and transport badge.
 - Camera/microphone permission flow and settings entry points on iOS.
 
+### Latest Updates (March 2026)
+
+- Windows app now enforces a single running instance to avoid duplicate listeners.
+- Main preview UI was refreshed with branded assets (app icon + wordmark), improved status/latency presentation, and camera list interactions.
+- Camera controls now support switching between 1080p and 4K stream configuration from the Windows UI.
+- Transport activation on Windows now waits for the iPhone Hello handshake before choosing the active path, improving QUIC/USB fallback behavior.
+- iOS client now keeps the screen awake while streaming and restores normal sleep behavior when streaming stops.
+- iOS camera session resolution now updates to match incoming configure requests (1080p or 4K).
+
 ---
 
 ## Known Prototype Limitations

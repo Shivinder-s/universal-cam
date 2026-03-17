@@ -1,7 +1,9 @@
+using System.Globalization;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -14,6 +16,45 @@ using UniversalCam.Core.Video;
 
 namespace UniversalCam.Views;
 
+// ── Value converters ──────────────────────────────────────────────────────────
+
+public sealed class BoolToHighlightConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, CultureInfo culture) =>
+        value is true
+            ? new SolidColorBrush(Color.FromRgb(0x3E, 0x3E, 0x42))
+            : Brushes.Transparent;
+
+    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>
+        throw new NotSupportedException();
+}
+
+public sealed class BoolToAccentConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, CultureInfo culture) =>
+        value is true
+            ? new SolidColorBrush(Color.FromRgb(0x51, 0x2B, 0xD4))
+            : new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55));
+
+    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>
+        throw new NotSupportedException();
+}
+
+// ── Camera view-model ─────────────────────────────────────────────────────────
+
+public sealed class CameraViewModel
+{
+    public string Id          { get; set; } = string.Empty;
+    public string Name        { get; set; } = string.Empty;
+    public string Position    { get; set; } = string.Empty;
+    public bool   IsSelected  { get; set; }
+
+    /// Adds a lens-type emoji prefix for visual clarity in the sidebar.
+    public string DisplayName => Name;
+}
+
+// ── MainWindow ────────────────────────────────────────────────────────────────
+
 public partial class MainWindow : Window
 {
     private ConnectionManager? _cm;
@@ -25,6 +66,8 @@ public partial class MainWindow : Window
     private int              _frameHeight;
     private WriteableBitmap? _bitmap;
     private int              _rotation; // 0 / 90 / 180 / 270
+
+    private string _currentCameraId = string.Empty;
 
     private readonly DispatcherTimer _vuTimer = new()
         { Interval = TimeSpan.FromMilliseconds(100) };
@@ -97,7 +140,7 @@ public partial class MainWindow : Window
         _audioPlayer = null;
     }
 
-    // ── Transport events (background thread) ─────────────────────────────────
+    // ── Transport events (background thread) ──────────────────────────────────
 
     private void OnStateChanged(object? sender, TransportState state)
     {
@@ -108,6 +151,7 @@ public partial class MainWindow : Window
 
             if (state == TransportState.Connected)
             {
+                txtDeviceName.Text = _cm?.DeviceName ?? "iPhone";
                 txtWaiting.Text    = "Connected — waiting for stream…";
                 btnStop.IsEnabled  = true;
                 btnMute.IsEnabled  = true;
@@ -116,14 +160,16 @@ public partial class MainWindow : Window
             }
             else if (state is TransportState.Disconnected or TransportState.Idle)
             {
+                txtDeviceName.Text     = "No device";
                 pnlNoStream.Visibility = Visibility.Visible;
                 imgPreview.Source      = null;
-                btnFlip.IsEnabled      = false;
+                icCameras.ItemsSource  = null;
                 btnStop.IsEnabled      = false;
                 btnMute.IsEnabled      = false;
                 pbVolume.IsEnabled     = false;
                 pbVolume.Value         = 0;
                 txtInfo.Text           = string.Empty;
+                txtLatency.Text        = string.Empty;
             }
         });
     }
@@ -140,7 +186,23 @@ public partial class MainWindow : Window
     {
         Dispatcher.BeginInvoke(() =>
         {
-            btnFlip.IsEnabled = msg.Cameras.Count > 1;
+            _currentCameraId = msg.CurrentCameraId;
+
+            var vms = msg.Cameras
+                .Select(c => new CameraViewModel
+                {
+                    Id         = c.Id,
+                    Name       = c.Name,
+                    Position   = c.Position,
+                    IsSelected = c.Id == msg.CurrentCameraId
+                })
+                .ToList();
+
+            icCameras.ItemsSource = vms;
+
+            // Update device name if ConnectionManager has it
+            if (_cm is not null && _cm.DeviceName is { Length: > 0 } name)
+                txtDeviceName.Text = name;
         });
     }
 
@@ -180,12 +242,21 @@ public partial class MainWindow : Window
         });
     }
 
-    // ── Button handlers ───────────────────────────────────────────────────────
+    // ── Button / control handlers ─────────────────────────────────────────────
 
-    private async void OnFlipClicked(object sender, RoutedEventArgs e)
+    private async void OnCameraRowClicked(object sender, RoutedEventArgs e)
     {
-        if (_cm is null) return;
+        if (sender is not FrameworkElement { Tag: string id } || _cm is null) return;
+        await _cm.SwitchCameraAsync(id);
+        await Task.Delay(300);
         await _cm.ListCamerasAsync();
+    }
+
+    private void OnQualityChanged(object sender, RoutedEventArgs e)
+    {
+        // Only reconfigure when already connected
+        if (_cm?.State == TransportState.Connected || _cm?.State == (TransportState)4 /* streaming */)
+            _ = SendConfigureAndStartAsync();
     }
 
     private void OnRotateClicked(object sender, RoutedEventArgs e)
@@ -212,7 +283,10 @@ public partial class MainWindow : Window
     private async Task SendConfigureAndStartAsync()
     {
         if (_cm is null) return;
-        await _cm.ConfigureAsync("1920x1080", 30, "h264", 8_000_000);
+        bool is4K  = rb4K.IsChecked == true;
+        string res = is4K ? "3840x2160" : "1920x1080";
+        int  rate  = is4K ? 25_000_000  : 8_000_000;
+        await _cm.ConfigureAsync(res, 30, "h264", rate);
     }
 
     private static string GetLocalIpHint()
@@ -227,7 +301,7 @@ public partial class MainWindow : Window
                 .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork)
                 .Select(a => a.Address.ToString())
                 .FirstOrDefault();
-            return ip is null ? string.Empty : $"PC: {ip}:7779";
+            return ip is null ? string.Empty : $"PC: {ip}";
         }
         catch { return string.Empty; }
     }
@@ -237,7 +311,7 @@ public partial class MainWindow : Window
         (ellStatus.Fill, txtStatus.Text) = state switch
         {
             TransportState.Idle         => (Brushes.Gray,       "Idle"),
-            TransportState.Listening    => (Brushes.DodgerBlue, "Waiting for iPhone…"),
+            TransportState.Listening    => (Brushes.DodgerBlue, "Searching…"),
             TransportState.Connected    => (Brushes.LimeGreen,  "Connected"),
             TransportState.Disconnected => (Brushes.Orange,     "Disconnected"),
             TransportState.Error        => (Brushes.OrangeRed,  "Error"),

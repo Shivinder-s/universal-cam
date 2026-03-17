@@ -92,6 +92,7 @@ final class ConnectionManager: ObservableObject {
 
     func disconnect() {
         stopStreaming()
+        UIApplication.shared.isIdleTimerDisabled = false
         wifiTransport.disconnect()
         // Don't stop USB listener — keep it available for reconnection
         discovery.stop()
@@ -124,6 +125,9 @@ final class ConnectionManager: ObservableObject {
         // Start audio capture
         audioCapture.start()
 
+        // Keep screen on while streaming
+        UIApplication.shared.isIdleTimerDisabled = true
+
         state = .streaming
         startPingTimer()
         print("[ConnectionManager] Streaming started via \(activeTransport?.rawValue ?? "unknown")")
@@ -139,6 +143,9 @@ final class ConnectionManager: ObservableObject {
 
         // Flush encoder
         encoder.flush()
+
+        // Allow screen to sleep again
+        UIApplication.shared.isIdleTimerDisabled = false
 
         state = .connected
         pingTimer?.invalidate()
@@ -381,6 +388,10 @@ final class ConnectionManager: ObservableObject {
             if components.count == 2,
                let width = Int32(components[0]),
                let height = Int32(components[1]) {
+                // Update capture session preset to match requested resolution
+                let preset: AVCaptureSession.Preset = (width >= 3840) ? .hd4K3840x2160 : .hd1920x1080
+                cameraSession?.setResolution(preset)
+
                 encoder.prepare(width: width, height: height, fps: Int32(fps), bitrate: bitrate)
                 isEncoderPrepared = true
             }

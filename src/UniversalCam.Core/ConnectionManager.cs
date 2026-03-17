@@ -40,6 +40,9 @@ public sealed class ConnectionManager : IAsyncDisposable
     /// Which transport is currently active.
     public TransportType ActiveTransport { get; private set; } = TransportType.None;
 
+    /// Device name received from the iPhone's Hello message.
+    public string DeviceName { get; private set; } = "iPhone";
+
     // ── Transports ───────────────────────────────────────────────────────────
 
     private readonly QuicServer      _quic    = new();
@@ -138,15 +141,8 @@ public sealed class ConnectionManager : IAsyncDisposable
 
         switch (state)
         {
-            case TransportState.Connected:
-                // If we have no active transport yet, claim it
-                if (_active is null)
-                {
-                    _active         = transport;
-                    ActiveTransport = type;
-                    SetState(TransportState.Connected);
-                }
-                break;
+            // Don't claim active on Connected — wait for Hello handshake instead.
+            // This prevents a fast-failing QUIC connection from blocking USB.
 
             case TransportState.Disconnected:
             case TransportState.Error:
@@ -168,6 +164,7 @@ public sealed class ConnectionManager : IAsyncDisposable
         {
             case Hello hello:
                 Console.WriteLine($"  Device: {hello.DeviceName}, capabilities: [{string.Join(", ", hello.Capabilities)}]");
+                DeviceName = hello.DeviceName;
 
                 // Promote this transport to active if not already set
                 if (_active is null)
