@@ -160,45 +160,84 @@
 
                 <Separator DockPanel.Dock="Top" Background="#333" Margin="0,0,0,0" />
 
-                <!-- Camera list -->
-                <TextBlock DockPanel.Dock="Top"
-                           Style="{StaticResource GroupHeader}"
-                           Text="CAMERAS" />
+                <!-- BACK cameras -->
+                <StackPanel x:Name="pnlBack"
+                            DockPanel.Dock="Top"
+                            Visibility="Collapsed">
+                    <TextBlock Style="{StaticResource GroupHeader}" Text="BACK" />
+                    <ItemsControl x:Name="icBackCameras">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Button Tag="{Binding Id}"
+                                        Click="OnCameraRowClicked"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Padding="0"
+                                        HorizontalContentAlignment="Stretch"
+                                        Cursor="Hand">
+                                    <Button.Template>
+                                        <ControlTemplate TargetType="Button">
+                                            <ContentPresenter />
+                                        </ControlTemplate>
+                                    </Button.Template>
+                                    <Border CornerRadius="4" Padding="10,6" Margin="6,2"
+                                            Background="{Binding IsSelected, Converter={StaticResource BoolToHighlightConverter}}">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Ellipse Width="7" Height="7"
+                                                     Margin="0,0,8,0"
+                                                     VerticalAlignment="Center"
+                                                     Fill="{Binding IsSelected, Converter={StaticResource BoolToAccentConverter}}" />
+                                            <TextBlock Text="{Binding DisplayName}"
+                                                       Foreground="White"
+                                                       FontSize="13"
+                                                       VerticalAlignment="Center" />
+                                        </StackPanel>
+                                    </Border>
+                                </Button>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
 
-                <ItemsControl DockPanel.Dock="Top"
-                              x:Name="icCameras"
-                              Margin="0,0,0,4">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate>
-                            <Button Tag="{Binding Id}"
-                                    Click="OnCameraRowClicked"
-                                    Background="Transparent"
-                                    BorderThickness="0"
-                                    Padding="0"
-                                    HorizontalContentAlignment="Stretch"
-                                    Cursor="Hand">
-                                <Button.Template>
-                                    <ControlTemplate TargetType="Button">
-                                        <ContentPresenter />
-                                    </ControlTemplate>
-                                </Button.Template>
-                                <Border CornerRadius="4" Padding="10,6" Margin="6,2"
-                                        Background="{Binding IsSelected, Converter={StaticResource BoolToHighlightConverter}}">
-                                    <StackPanel Orientation="Horizontal">
-                                        <Ellipse Width="7" Height="7"
-                                                 Margin="0,0,8,0"
-                                                 VerticalAlignment="Center"
-                                                 Fill="{Binding IsSelected, Converter={StaticResource BoolToAccentConverter}}" />
-                                        <TextBlock Text="{Binding DisplayName}"
-                                                   Foreground="White"
-                                                   FontSize="13"
-                                                   VerticalAlignment="Center" />
-                                    </StackPanel>
-                                </Border>
-                            </Button>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
+                <!-- FRONT cameras -->
+                <StackPanel x:Name="pnlFront"
+                            DockPanel.Dock="Top"
+                            Visibility="Collapsed"
+                            Margin="0,0,0,4">
+                    <TextBlock Style="{StaticResource GroupHeader}" Text="FRONT" />
+                    <ItemsControl x:Name="icFrontCameras">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Button Tag="{Binding Id}"
+                                        Click="OnCameraRowClicked"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Padding="0"
+                                        HorizontalContentAlignment="Stretch"
+                                        Cursor="Hand">
+                                    <Button.Template>
+                                        <ControlTemplate TargetType="Button">
+                                            <ContentPresenter />
+                                        </ControlTemplate>
+                                    </Button.Template>
+                                    <Border CornerRadius="4" Padding="10,6" Margin="6,2"
+                                            Background="{Binding IsSelected, Converter={StaticResource BoolToHighlightConverter}}">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Ellipse Width="7" Height="7"
+                                                     Margin="0,0,8,0"
+                                                     VerticalAlignment="Center"
+                                                     Fill="{Binding IsSelected, Converter={StaticResource BoolToAccentConverter}}" />
+                                            <TextBlock Text="{Binding DisplayName}"
+                                                       Foreground="White"
+                                                       FontSize="13"
+                                                       VerticalAlignment="Center" />
+                                        </StackPanel>
+                                    </Border>
+                                </Button>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
 
                 <Separator DockPanel.Dock="Top" Background="#333" />
 
