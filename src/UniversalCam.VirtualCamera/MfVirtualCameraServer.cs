@@ -24,6 +24,11 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
     private Task? _frameDeliveryTask;
     private CancellationTokenSource? _cts;
 
+    /// <summary>
+    /// Value of MF_VERSION constant used with MFStartup.
+    /// </summary>
+    private const uint MF_VERSION = 0x00020070;  // MF_SDK_VERSION for Windows 11
+
     public MfVirtualCameraServer(FrameBuffer frameBuffer)
     {
         _frameBuffer = frameBuffer ?? throw new ArgumentNullException(nameof(frameBuffer));
@@ -38,26 +43,15 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
             Console.WriteLine("[MfVirtualCameraServer] Initializing (Windows 11 22H2+)");
 
             // Step 1: Initialize Media Foundation
-            try
+            if (!InitializeMediaFoundation())
             {
-                InitializeMediaFoundation();
-                _mfStartupCalled = true;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[MfVirtualCameraServer] MF init failed (CsWin32 integration pending): {ex.Message}");
-                // Continue with simulation mode for now
+                Console.WriteLine("[MfVirtualCameraServer] MF initialization deferred (CsWin32 P/Invoke pending)");
             }
 
             // Step 2: Create and register virtual camera
-            try
+            if (!CreateVirtualCamera())
             {
-                CreateVirtualCamera();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[MfVirtualCameraServer] Virtual camera creation failed: {ex.Message}");
-                // Fall back to frame simulation
+                Console.WriteLine("[MfVirtualCameraServer] Virtual camera creation deferred (CsWin32 P/Invoke pending)");
             }
 
             // Step 3: Start async frame delivery loop
@@ -76,45 +70,119 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
 
     /// <summary>
     /// Initialize Media Foundation runtime.
-    /// Once CsWin32 generates P/Invoke for MFStartup, uncomment the real call.
+    ///
+    /// PHASE 2B: Uncomment the actual P/Invoke call when CsWin32 generates stubs.
+    /// This method will call MFStartup with the appropriate flags and version.
     /// </summary>
-    private void InitializeMediaFoundation()
+    private bool InitializeMediaFoundation()
     {
-        // TODO (Phase 2B - CsWin32 Integration):
-        // Uncomment when NativeMethods.txt-generated stubs are available:
-        //
-        // const uint MFSTARTUP_LITE = 0x00000000;
-        // HResult hr = Windows.Win32.Media.MediaFoundation.MFStartup(
-        //     Windows.Win32.Media.MediaFoundation.MF_VERSION,
-        //     MFSTARTUP_LITE);
-        // if (hr < 0)
-        //     throw new InvalidOperationException($"MFStartup failed: 0x{hr:X}");
-        //
-        Console.WriteLine("[MfVirtualCameraServer] MFStartup: placeholder (CsWin32 integration pending)");
+        try
+        {
+            // TODO (Phase 2B - CsWin32 Integration):
+            // Uncomment when NativeMethods.txt-generated stubs are available:
+            //
+            // using Windows.Win32.Media.MediaFoundation;
+            //
+            // const uint MFSTARTUP_LITE = 0x00000000;
+            // HResult hr = MediaFoundation.MFStartup(MF_VERSION, MFSTARTUP_LITE);
+            // if (hr < 0)
+            // {
+            //     Console.WriteLine($"[MfVirtualCameraServer] MFStartup failed: 0x{hr:X}");
+            //     return false;
+            // }
+            //
+            // _mfStartupCalled = true;
+            // Console.WriteLine("[MfVirtualCameraServer] MFStartup() succeeded");
+            // return true;
+
+            // For now, log placeholder
+            Console.WriteLine("[MfVirtualCameraServer] MFStartup: CsWin32 integration pending");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MfVirtualCameraServer] MFStartup failed: {ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>
     /// Create and register the virtual camera device.
-    /// TODO: Integrate with IMFVirtualCamera once CsWin32 P/Invoke is available.
+    ///
+    /// PHASE 2B: Uncomment the actual P/Invoke calls when CsWin32 generates stubs.
+    /// This method will:
+    /// 1. Create an IMFMediaType with NV12 format
+    /// 2. Call MFCreateVirtualCamera to register the device
+    /// 3. Start the virtual camera
     /// </summary>
-    private void CreateVirtualCamera()
+    private bool CreateVirtualCamera()
     {
-        // TODO (Phase 2B - CsWin32 Integration):
-        // Uncomment and integrate when CsWin32 provides IMFVirtualCamera P/Invoke:
-        //
-        // var mediaType = Windows.Win32.Media.MediaFoundation.MFCreateMediaType();
-        // mediaType.SetUINT32(MF_MT_FRAME_RATE, 30);
-        // mediaType.SetUINT32(MF_MT_FRAME_SIZE, (uint)(_mediaSourceWrapper.Width << 16 | _mediaSourceWrapper.Height));
-        // mediaType.SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        //
-        // _virtualCamera = Windows.Win32.Media.MediaFoundation.MFCreateVirtualCamera(
-        //     Windows.Win32.Media.MediaFoundation.MFCameraDeviceType.MF_CAMERA_TYPE_SYNTHETIC,
-        //     "UniversalCam",
-        //     _mediaSourceWrapper);
-        //
-        // ((IMFVirtualCamera)_virtualCamera).Start();
-        //
-        Console.WriteLine("[MfVirtualCameraServer] Virtual camera creation: placeholder (CsWin32 integration pending)");
+        try
+        {
+            // TODO (Phase 2B - CsWin32 Integration):
+            // Uncomment when CsWin32 provides IMFVirtualCamera, IMFMediaType P/Invoke:
+            //
+            // using Windows.Win32.Media.MediaFoundation;
+            // using Windows.Win32.Media.MediaFoundation.Mpeg2;
+            //
+            // Step 1: Create and configure media type
+            // var mediaType = MediaFoundation.MFCreateMediaType();
+            // if (mediaType == null)
+            // {
+            //     Console.WriteLine("[MfVirtualCameraServer] MFCreateMediaType failed");
+            //     return false;
+            // }
+            //
+            // mediaType.SetUINT32(Windows.Win32.Media.MediaFoundation.MF_MT_MAJOR_TYPE,
+            //                     (uint)MediaType.Video);
+            // mediaType.SetUINT32(Windows.Win32.Media.MediaFoundation.MF_MT_SUBTYPE,
+            //                     (uint)Mpeg2VideoFormat.NV12);
+            // mediaType.SetUINT32(Windows.Win32.Media.MediaFoundation.MF_MT_FRAME_SIZE,
+            //                     ((uint)_mediaSourceWrapper.Width << 16) | (uint)_mediaSourceWrapper.Height);
+            // mediaType.SetUINT32(Windows.Win32.Media.MediaFoundation.MF_MT_FRAME_RATE,
+            //                     (uint)_mediaSourceWrapper.FramesPerSecond);
+            // mediaType.SetUINT32(Windows.Win32.Media.MediaFoundation.MF_MT_MEDIA_TYPE_FLAGS,
+            //                     0);
+            //
+            // Step 2: Create virtual camera
+            // var hr = MediaFoundation.MFCreateVirtualCamera(
+            //     MFCameraDeviceType.Synth,
+            //     0,
+            //     "UniversalCam",
+            //     (ushort)_mediaSourceWrapper.Width,
+            //     (ushort)_mediaSourceWrapper.Height,
+            //     mediaType,
+            //     _mediaSourceWrapper,
+            //     out var vCam);
+            //
+            // if (hr < 0 || vCam == null)
+            // {
+            //     Console.WriteLine($"[MfVirtualCameraServer] MFCreateVirtualCamera failed: 0x{hr:X}");
+            //     return false;
+            // }
+            //
+            // Step 3: Start the virtual camera
+            // hr = vCam.Start();
+            // if (hr < 0)
+            // {
+            //     Console.WriteLine($"[MfVirtualCameraServer] vCam.Start() failed: 0x{hr:X}");
+            //     vCam.Dispose();
+            //     return false;
+            // }
+            //
+            // _virtualCamera = vCam;
+            // Console.WriteLine("[MfVirtualCameraServer] Virtual camera registered and started");
+            // return true;
+
+            // For now, log placeholder
+            Console.WriteLine("[MfVirtualCameraServer] Virtual camera creation: CsWin32 integration pending");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MfVirtualCameraServer] Virtual camera creation failed: {ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>
@@ -155,6 +223,8 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
     /// <summary>
     /// Updates the virtual camera media type when resolution/fps changes.
     /// Propagates changes to the media source wrapper.
+    ///
+    /// PHASE 2B: Signal format change events to consumers once MF is integrated.
     /// </summary>
     public void UpdateMediaType(int width, int height, long fps)
     {
@@ -164,7 +234,11 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
             Console.WriteLine($"[MfVirtualCameraServer] Media type updated: {width}×{height} @ {fps}fps");
 
             // TODO (Phase 2B): Once MF is integrated, signal format change event:
-            // _virtualCamera?.NotifyFormatChange(...);
+            // if (_virtualCamera is IMFVirtualCamera vCam)
+            // {
+            //     // Notify consumers of format change
+            //     _mediaSourceWrapper.GetStreamByIndex(0)?.NotifyFormatChanged(width, height, fps);
+            // }
         }
         catch (Exception ex)
         {
@@ -188,14 +262,20 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
             }
 
             // TODO (Phase 2B): Clean up MF resources:
-            // if (_virtualCamera != null)
+            // if (_virtualCamera is IMFVirtualCamera vCam)
             // {
-            //     ((IMFVirtualCamera)_virtualCamera).Stop();
-            //     ((IMFVirtualCamera)_virtualCamera).Remove();
+            //     vCam.Stop();
+            //     vCam.Dispose();
+            //     _virtualCamera = null;
             // }
+            //
             // if (_mfStartupCalled)
-            //     Windows.Win32.Media.MediaFoundation.MFShutdown();
+            // {
+            //     MediaFoundation.MFShutdown();
+            //     _mfStartupCalled = false;
+            // }
 
+            _mediaSourceWrapper?.Dispose();
             Console.WriteLine("[MfVirtualCameraServer] Disposed");
         }
         catch (Exception ex)
