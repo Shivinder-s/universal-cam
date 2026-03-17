@@ -14,8 +14,12 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
     private readonly FrameBuffer _frameBuffer;
     private readonly MfMediaSourceWrapper _mediaSourceWrapper;
     private object? _virtualCamera;  // IMFVirtualCamera once CsWin32 P/Invoke is available
+#pragma warning disable CS0169 // Field used in Phase 2B when CsWin32 generates P/Invoke
+#pragma warning restore CS0169
     private bool _isRunning;
+#pragma warning disable CS0414 // Field used in Phase 2B when CsWin32 generates P/Invoke
     private bool _mfStartupCalled;
+#pragma warning restore CS0414
     private bool _disposed;
     private Task? _frameDeliveryTask;
     private CancellationTokenSource? _cts;

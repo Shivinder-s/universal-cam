@@ -104,7 +104,7 @@ public class FrameBufferTests
     }
 
     [Fact]
-    public void FrameBuffer_ConcurrentProducerConsumer_IsThreadSafe()
+    public async Task FrameBuffer_ConcurrentProducerConsumer_IsThreadSafe()
     {
         // Arrange
         var buffer = new FrameBuffer(capacity: 10);
@@ -155,7 +155,8 @@ public class FrameBufferTests
             }
         });
 
-        Task.WaitAll(producer, consumer);
+        // Use await instead of blocking Task.WaitAll to satisfy xUnit1031
+        await Task.WhenAll(producer, consumer);
 
         // Assert
         Assert.Empty(errors);

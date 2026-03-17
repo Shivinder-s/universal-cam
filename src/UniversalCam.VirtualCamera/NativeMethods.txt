@@ -1,12 +1,8 @@
+MFStartup
 MFCreateVirtualCamera
 MFCreateMediaType
 MFCreateSample
 MFCreateMemoryBuffer
-MFGetAttributeAsUINT32
-MFSetAttributeUINT32
-MFGetAttributeAsIUnknown
-MFSetAttributeIUnknown
-MFStartup
 IMFVirtualCamera
 IMFMediaSource
 IMFMediaStream
