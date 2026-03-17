@@ -1,148 +1,246 @@
 using System;
+using System.Runtime.InteropServices;
 
 namespace UniversalCam.VirtualCamera;
 
 /// <summary>
-/// Media Foundation media source wrapper for Windows 11 virtual camera.
-/// Adapts our FrameBuffer to provide frames in the format expected by IMFMediaSource.
-/// This class will implement IMFMediaSource once CsWin32 generates the P/Invoke.
-///
-/// PHASE 2B: Uncomment the interface implementation and implement the methods below
-/// once CsWin32 generates Windows.Win32.Media.MediaFoundation.IMFMediaSource P/Invoke.
+/// COM-visible IMFMediaSource implementation for the Windows 11 22H2+ virtual camera.
+/// Windows calls into this object when a browser/Teams/OBS opens the virtual camera.
 /// </summary>
-internal sealed class MfMediaSourceWrapper
+[ComVisible(true)]
+[ClassInterface(ClassInterfaceType.None)]
+internal sealed class MfMediaSourceWrapper : IMFMediaSource, IDisposable
 {
     private readonly FrameBuffer _frameBuffer;
-    private readonly MfMediaStream _mediaStream;
-    private int _width = 1920;
+    private MfEventQueue? _eventQueue;
+    private MfMediaStream? _mediaStream;
+    private IMFStreamDescriptor? _streamDescriptor;
+    private IMFPresentationDescriptor? _presentationDescriptor;
+
+    private int _width  = 1920;
     private int _height = 1080;
-    private long _fps = 30;
+    private long _fps   = 30;
+    private bool _isShutdown;
     private bool _disposed;
 
-    public int Width => _width;
-    public int Height => _height;
+    public int  Width          => _width;
+    public int  Height         => _height;
     public long FramesPerSecond => _fps;
 
     public MfMediaSourceWrapper(FrameBuffer frameBuffer)
     {
         _frameBuffer = frameBuffer ?? throw new ArgumentNullException(nameof(frameBuffer));
-        _mediaStream = new MfMediaStream(0, this);
+
+        int hr = NativeMF.MFCreateEventQueue(out _eventQueue);
+        if (!NativeMF.Succeeded(hr))
+            throw new COMException("[MfMediaSourceWrapper] MFCreateEventQueue failed", hr);
+
+        // Build initial stream descriptor and media stream
+        BuildStreamDescriptor(_width, _height, _fps);
+        _mediaStream = new MfMediaStream(0, this, _streamDescriptor!);
     }
 
-    /// <summary>
-    /// Updates the expected frame resolution and frame rate.
-    /// Called when the iPhone sends a configure message.
-    /// </summary>
+    // ── Public helpers called by MfVirtualCameraServer ────────────────────
+
     public void UpdateMediaType(int width, int height, long fps)
     {
-        _width = width;
+        _width  = width;
         _height = height;
-        _fps = fps;
+        _fps    = fps;
         Console.WriteLine($"[MfMediaSourceWrapper] Media type updated: {width}×{height} @ {fps}fps");
-
-        // Notify stream of format change
         _mediaStream?.NotifyFormatChanged(width, height, fps);
     }
 
-    /// <summary>
-    /// Gets the next frame from the buffer, or returns null if unavailable.
-    /// </summary>
-    public NV12Frame? GetNextFrame()
+    public NV12Frame? GetNextFrame() =>
+        _frameBuffer.TryDequeue(out var frame) ? frame : null;
+
+    public void ClearFrames() => _frameBuffer.Clear();
+
+    public MfMediaStream? GetStreamByIndex(int index) =>
+        index == 0 ? _mediaStream : null;
+
+    // ── IMFMediaEventGenerator (and the re-declared new slots on IMFMediaSource) ──
+
+    void IMFMediaEventGenerator.GetEvent(uint dwFlags, out IMFMediaEvent ppEvent)
+        => GetEventImpl(dwFlags, out ppEvent);
+    void IMFMediaSource.GetEvent(uint dwFlags, out IMFMediaEvent ppEvent)
+        => GetEventImpl(dwFlags, out ppEvent);
+    private void GetEventImpl(uint dwFlags, out IMFMediaEvent ppEvent)
     {
-        if (_frameBuffer.TryDequeue(out var frame))
-            return frame;
-        return null;
+        ThrowIfShutdown();
+        _eventQueue!.GetEvent(dwFlags, out ppEvent);
     }
 
-    /// <summary>
-    /// Clears all pending frames from the buffer.
-    /// Called on disconnect or media type change.
-    /// </summary>
-    public void ClearFrames()
+    void IMFMediaEventGenerator.BeginGetEvent(IMFAsyncCallback pCallback, object punkState)
+        => BeginGetEventImpl(pCallback, punkState);
+    void IMFMediaSource.BeginGetEvent(IMFAsyncCallback pCallback, object punkState)
+        => BeginGetEventImpl(pCallback, punkState);
+    private void BeginGetEventImpl(IMFAsyncCallback pCallback, object punkState)
     {
-        _frameBuffer.Clear();
+        ThrowIfShutdown();
+        // Convert managed COM objects to raw pointers for vtable call
+        IntPtr cbPtr    = pCallback  != null ? Marshal.GetIUnknownForObject(pCallback)  : IntPtr.Zero;
+        IntPtr statePtr = punkState  != null ? Marshal.GetIUnknownForObject(punkState)  : IntPtr.Zero;
+        try { _eventQueue!.BeginGetEvent(cbPtr, statePtr); }
+        finally
+        {
+            if (cbPtr    != IntPtr.Zero) Marshal.Release(cbPtr);
+            if (statePtr != IntPtr.Zero) Marshal.Release(statePtr);
+        }
     }
 
-    #region IMFMediaSource Method Stubs (Phase 2B)
-    // PHASE 2B (CsWin32 Integration):
-    // Uncomment interface implementation below once CsWin32 generates P/Invoke stubs
-    // from NativeMethods.txt. Then implement the following methods:
-
-    /// <summary>
-    /// Gets the media source characteristics.
-    /// Returns: MFMEDIASOURCE_CAN_SEEK | MFMEDIASOURCE_CAN_PAUSE
-    /// </summary>
-    public void GetCharacteristics()
+    void IMFMediaEventGenerator.EndGetEvent(IMFAsyncResult pResult, out IMFMediaEvent ppEvent)
+        => EndGetEventImpl(pResult, out ppEvent);
+    void IMFMediaSource.EndGetEvent(IMFAsyncResult pResult, out IMFMediaEvent ppEvent)
+        => EndGetEventImpl(pResult, out ppEvent);
+    private void EndGetEventImpl(IMFAsyncResult pResult, out IMFMediaEvent ppEvent)
     {
-        // TODO: Return uint with capability flags once P/Invoke available
-        // const uint MFMEDIASOURCE_CAN_SEEK = 0x00000001;
-        // const uint MFMEDIASOURCE_CAN_PAUSE = 0x00000002;
-        // const uint MFMEDIASOURCE_IS_LIVE = 0x00000004;
-        // return MFMEDIASOURCE_IS_LIVE;  // Live source, no seeking
+        ThrowIfShutdown();
+        IntPtr resPtr = pResult != null ? Marshal.GetIUnknownForObject(pResult) : IntPtr.Zero;
+        try { _eventQueue!.EndGetEvent(resPtr, out ppEvent); }
+        finally { if (resPtr != IntPtr.Zero) Marshal.Release(resPtr); }
     }
 
-    /// <summary>
-    /// Gets source-level attributes (empty for now).
-    /// </summary>
-    public void GetSourceAttributes()
+    void IMFMediaEventGenerator.QueueEvent(uint met, ref Guid guidExtendedType, int hrStatus, ref PropVariant pvValue)
+        => QueueEventImpl(met, ref guidExtendedType, hrStatus, ref pvValue);
+    void IMFMediaSource.QueueEvent(uint met, ref Guid guidExtendedType, int hrStatus, ref PropVariant pvValue)
+        => QueueEventImpl(met, ref guidExtendedType, hrStatus, ref pvValue);
+    private void QueueEventImpl(uint met, ref Guid guidExtendedType, int hrStatus, ref PropVariant pvValue)
     {
-        // TODO: Return IMFAttributes collection once P/Invoke available
-        // Create a new attributes object and return it
+        ThrowIfShutdown();
+        _eventQueue!.QueueEvent(met, ref guidExtendedType, hrStatus, ref pvValue);
     }
 
-    /// <summary>
-    /// Gets the number of streams (always 1 for video capture).
-    /// </summary>
-    public int GetStreamCount()
+    // ── IMFMediaSource ─────────────────────────────────────────────────────
+
+    void IMFMediaSource.GetCharacteristics(out uint pdwCharacteristics)
     {
-        return 1;
+        ThrowIfShutdown();
+        pdwCharacteristics = NativeMF.MFMEDIASOURCE_IS_LIVE;
     }
 
-    /// <summary>
-    /// Gets the media stream by index.
-    /// </summary>
-    public MfMediaStream? GetStreamByIndex(int index)
+    void IMFMediaSource.CreatePresentationDescriptor(out IMFPresentationDescriptor ppPresentationDescriptor)
     {
-        if (index == 0)
-            return _mediaStream;
-        return null;
+        ThrowIfShutdown();
+        if (_presentationDescriptor == null)
+            throw new COMException("[MfMediaSourceWrapper] Presentation descriptor not built", unchecked((int)0x80070057));
+        // Clone so callers can't mutate our copy
+        _presentationDescriptor.Clone(out ppPresentationDescriptor);
     }
 
-    /// <summary>
-    /// Called when Media Foundation starts playback.
-    /// </summary>
-    public void Start()
+    void IMFMediaSource.Start(IMFPresentationDescriptor pPresentationDescriptor,
+                              ref Guid pguidTimeFormat, ref PropVariant pvarStartPosition)
     {
+        ThrowIfShutdown();
         _mediaStream?.Start();
+
+        // Fire MENewStream so MF knows our stream exists
+        var empty = PropVariant.Empty;
+        var nullGuid = NativeMF.GUID_NULL;
+        _eventQueue!.QueueEventParamUnk(NativeMF.MENewStream, ref nullGuid, 0, _mediaStream!);
+
+        // Fire MESourceStarted
+        _eventQueue.QueueEventParamVar(NativeMF.MESourceStarted, ref nullGuid, 0, ref empty);
         Console.WriteLine("[MfMediaSourceWrapper] Started");
     }
 
-    /// <summary>
-    /// Called when Media Foundation pauses playback.
-    /// </summary>
-    public void Pause()
+    void IMFMediaSource.Stop()
     {
+        ThrowIfShutdown();
+        _mediaStream?.Stop();
+        var empty    = PropVariant.Empty;
+        var nullGuid = NativeMF.GUID_NULL;
+        _eventQueue!.QueueEventParamVar(NativeMF.MESourceStopped, ref nullGuid, 0, ref empty);
+        Console.WriteLine("[MfMediaSourceWrapper] Stopped");
+    }
+
+    void IMFMediaSource.Pause()
+    {
+        ThrowIfShutdown();
         _mediaStream?.Pause();
+        var empty    = PropVariant.Empty;
+        var nullGuid = NativeMF.GUID_NULL;
+        _eventQueue!.QueueEventParamVar(NativeMF.MESourcePaused, ref nullGuid, 0, ref empty);
         Console.WriteLine("[MfMediaSourceWrapper] Paused");
     }
 
-    /// <summary>
-    /// Called when Media Foundation stops playback.
-    /// </summary>
-    public void Stop()
+    void IMFMediaSource.Shutdown()
     {
-        _mediaStream?.Stop();
-        Console.WriteLine("[MfMediaSourceWrapper] Stopped");
+        if (_isShutdown) return;
+        _isShutdown = true;
+        _mediaStream?.Shutdown();
+        _eventQueue?.Shutdown();
+        Console.WriteLine("[MfMediaSourceWrapper] Shutdown");
     }
-    #endregion
+
+    // ── Private helpers ────────────────────────────────────────────────────
+
+    private void BuildStreamDescriptor(int width, int height, long fps)
+    {
+        // Create an NV12 media type
+        int hr = NativeMF.MFCreateMediaType(out var mediaType);
+        NativeMF.ThrowIfFailed(hr, "MFCreateMediaType");
+
+        // Copy static GUIDs to locals — static readonly fields can't be passed as ref
+        Guid keyMajorType  = NativeMF.MF_MT_MAJOR_TYPE;
+        Guid keySubtype    = NativeMF.MF_MT_SUBTYPE;
+        Guid keyFrameSize  = NativeMF.MF_MT_FRAME_SIZE;
+        Guid keyFrameRate  = NativeMF.MF_MT_FRAME_RATE;
+        Guid keyPar        = NativeMF.MF_MT_PIXEL_ASPECT_RATIO;
+        Guid keyInterlace  = NativeMF.MF_MT_INTERLACE_MODE;
+        Guid keyAllIndep   = NativeMF.MF_MT_ALL_SAMPLES_INDEPENDENT;
+        Guid valVideo      = NativeMF.MFMediaType_Video;
+        Guid valNV12       = NativeMF.MFVideoFormat_NV12;
+
+        mediaType.SetGUID(ref keyMajorType, ref valVideo);
+        mediaType.SetGUID(ref keySubtype,   ref valNV12);
+
+        // Frame size packed as (width << 32 | height)
+        ulong frameSize = ((ulong)width << 32) | (uint)height;
+        mediaType.SetUINT64(ref keyFrameSize, frameSize);
+
+        // Frame rate packed as (numerator << 32 | denominator)
+        ulong frameRate = ((ulong)fps << 32) | 1;
+        mediaType.SetUINT64(ref keyFrameRate, frameRate);
+
+        // Pixel aspect ratio 1:1
+        ulong par = (1UL << 32) | 1;
+        mediaType.SetUINT64(ref keyPar, par);
+
+        // Progressive frames
+        mediaType.SetUINT32(ref keyInterlace, 2);   // MFVideoInterlace_Progressive
+        mediaType.SetUINT32(ref keyAllIndep,  1);
+
+        // Build stream descriptor from the media type
+        hr = NativeMF.MFCreateStreamDescriptor(0, 1, new[] { mediaType }, out _streamDescriptor);
+        NativeMF.ThrowIfFailed(hr, "MFCreateStreamDescriptor");
+
+        // Set the current media type on the handler
+        _streamDescriptor!.GetMediaTypeHandler(out var handler);
+        handler.SetCurrentMediaType(mediaType);
+
+        // Build presentation descriptor
+        hr = NativeMF.MFCreatePresentationDescriptor(1, new[] { _streamDescriptor }, out _presentationDescriptor);
+        NativeMF.ThrowIfFailed(hr, "MFCreatePresentationDescriptor");
+        _presentationDescriptor!.SelectStream(0);
+    }
+
+    private void ThrowIfShutdown()
+    {
+        if (_isShutdown)
+            throw new COMException("[MfMediaSourceWrapper] Source is shut down", NativeMF.MF_E_SHUTDOWN);
+    }
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
-
+        if (_disposed) return;
+        _disposed = true;
         _mediaStream?.Dispose();
         _frameBuffer.Clear();
-        _disposed = true;
+        if (_eventQueue != null)
+        {
+            Marshal.ReleaseComObject(_eventQueue);
+            _eventQueue = null;
+        }
     }
 }

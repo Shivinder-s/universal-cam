@@ -146,7 +146,7 @@ public sealed class VirtualCameraSession : IDisposable
             return;
 
         bool wasConnected = _isConnected;
-        _isConnected = state == TransportState.Connected || state == (TransportState)4;  // 4 = Streaming
+        _isConnected = state == TransportState.Connected;
 
         if (_isConnected && !wasConnected)
         {

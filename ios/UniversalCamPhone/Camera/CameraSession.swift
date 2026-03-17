@@ -7,6 +7,12 @@ struct CameraInfo: Codable, Identifiable, Equatable {
     let name: String          // Localised device name
     let position: String      // "front", "back", or "unspecified"
     let type: String          // e.g. "wide_angle"
+    let zoomFactor: Double    // Optical zoom relative to 1× wide angle (0.5, 1.0, 3.0, …)
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, position, type
+        case zoomFactor = "zoom_factor"
+    }
 }
 
 /// Wraps AVCaptureSession and exposes camera state as @Published properties.
@@ -34,13 +40,13 @@ final class CameraSession: NSObject, ObservableObject {
 
     /// Discovers all available video cameras on this device.
     func discoverCameras() {
+        // Only enumerate individual physical lenses — exclude virtual compound devices
+        // (builtInDualCamera, builtInDualWideCamera, builtInTripleCamera) which would
+        // produce duplicate "Wide 1×" entries alongside the real single-lens cameras.
         let deviceTypes: [AVCaptureDevice.DeviceType] = [
             .builtInWideAngleCamera,
             .builtInUltraWideCamera,
             .builtInTelephotoCamera,
-            .builtInDualCamera,
-            .builtInDualWideCamera,
-            .builtInTripleCamera,
             .builtInTrueDepthCamera
         ]
 
@@ -55,7 +61,8 @@ final class CameraSession: NSObject, ObservableObject {
                 id: device.uniqueID,
                 name: device.localizedName,
                 position: positionString(device.position),
-                type: deviceTypeString(device.deviceType)
+                type: deviceTypeString(device.deviceType),
+                zoomFactor: opticalZoomFactor(for: device)
             )
         }
 
@@ -106,7 +113,8 @@ final class CameraSession: NSObject, ObservableObject {
                 id: device.uniqueID,
                 name: device.localizedName,
                 position: self.positionString(device.position),
-                type: self.deviceTypeString(device.deviceType)
+                type: self.deviceTypeString(device.deviceType),
+                zoomFactor: self.opticalZoomFactor(for: device)
             )
             DispatchQueue.main.async {
                 self.currentCameraID = device.uniqueID
@@ -135,7 +143,8 @@ final class CameraSession: NSObject, ObservableObject {
                 id: device.uniqueID,
                 name: device.localizedName,
                 position: self.positionString(device.position),
-                type: self.deviceTypeString(device.deviceType)
+                type: self.deviceTypeString(device.deviceType),
+                zoomFactor: self.opticalZoomFactor(for: device)
             )
             DispatchQueue.main.async {
                 self.currentCameraID = device.uniqueID
@@ -152,6 +161,7 @@ final class CameraSession: NSObject, ObservableObject {
                 self.captureSession.sessionPreset = preset
             }
             self.captureSession.commitConfiguration()
+            self.applyLandscapeRotation()   // re-lock after preset change
         }
     }
 
@@ -173,6 +183,7 @@ final class CameraSession: NSObject, ObservableObject {
         addVideoOutput()
 
         captureSession.commitConfiguration()
+        applyLandscapeRotation()   // must be after commit — commit resets connection rotation
     }
 
     private func addVideoInput(device: AVCaptureDevice) {
@@ -189,17 +200,8 @@ final class CameraSession: NSObject, ObservableObject {
         videoOutput.alwaysDiscardsLateVideoFrames = true
         guard captureSession.canAddOutput(videoOutput) else { return }
         captureSession.addOutput(videoOutput)
-
-        // Lock to landscape-right (sensor native) — rotation handled on the Windows side.
-        // videoRotationAngle 0° = sensor native = landscape-right on iOS cameras.
-        // The deprecated videoOrientation .landscapeRight is the equivalent for < iOS 17.
-        if let connection = videoOutput.connection(with: .video) {
-            if #available(iOS 17.0, *) {
-                connection.videoRotationAngle = 0
-            } else {
-                connection.videoOrientation = .landscapeRight
-            }
-        }
+        // NOTE: do NOT call applyLandscapeRotation() here — commitConfiguration() resets
+        // the connection's rotation angle, so rotation must be applied after commit (see below).
     }
 
     private func reconfigureInput(with device: AVCaptureDevice) {
@@ -211,6 +213,20 @@ final class CameraSession: NSObject, ObservableObject {
             .forEach { captureSession.removeInput($0) }
         addVideoInput(device: device)
         captureSession.commitConfiguration()
+        applyLandscapeRotation()   // re-lock after input switch
+    }
+
+    /// Locks the video output connection to landscape-right (sensor native = 0°).
+    /// Call after any session configuration that may reset connection properties.
+    private func applyLandscapeRotation() {
+        guard let connection = videoOutput.connection(with: .video) else { return }
+        if #available(iOS 17.0, *) {
+            if connection.isVideoRotationAngleSupported(0) {
+                connection.videoRotationAngle = 0
+            }
+        } else {
+            connection.videoOrientation = .landscapeRight
+        }
     }
 
     private func currentVideoDevice() -> AVCaptureDevice? {
@@ -221,6 +237,27 @@ final class CameraSession: NSObject, ObservableObject {
     }
 
     // MARK: - Helpers
+
+    /// Returns the optical zoom factor relative to 1× wide angle for a given device.
+    /// Uses virtualDeviceSwitchOverVideoZoomFactors on the enclosing virtual device.
+    /// Formula: lastSwitchFactor × minAvailableVideoZoomFactor = real optical zoom.
+    private func opticalZoomFactor(for device: AVCaptureDevice) -> Double {
+        switch device.deviceType {
+        case .builtInUltraWideCamera: return 0.5
+        case .builtInWideAngleCamera: return 1.0
+        case .builtInTrueDepthCamera: return 1.0
+        case .builtInTelephotoCamera:
+            for virtualType: AVCaptureDevice.DeviceType in [.builtInTripleCamera, .builtInDualCamera] {
+                guard let vd = AVCaptureDevice.default(virtualType, for: .video, position: device.position),
+                      vd.constituentDevices.contains(device),
+                      let lastFactor = vd.virtualDeviceSwitchOverVideoZoomFactors.last
+                else { continue }
+                return Double(truncating: lastFactor) * Double(vd.minAvailableVideoZoomFactor)
+            }
+            return 2.0  // reasonable fallback
+        default: return 1.0
+        }
+    }
 
     private func positionString(_ position: AVCaptureDevice.Position) -> String {
         switch position {

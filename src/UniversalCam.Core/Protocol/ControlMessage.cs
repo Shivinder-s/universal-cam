@@ -153,8 +153,9 @@ public sealed record Pong : ControlMessage
 /// Describes a camera on the iPhone. Mirrors CameraInfo in CameraSession.swift.
 public sealed record CameraInfo
 {
-    [JsonPropertyName("id")]       public string Id       { get; init; } = string.Empty;
-    [JsonPropertyName("name")]     public string Name     { get; init; } = string.Empty;
-    [JsonPropertyName("position")] public string Position { get; init; } = string.Empty;
-    [JsonPropertyName("type")]     public string Type     { get; init; } = string.Empty;
+    [JsonPropertyName("id")]          public string Id         { get; init; } = string.Empty;
+    [JsonPropertyName("name")]        public string Name       { get; init; } = string.Empty;
+    [JsonPropertyName("position")]    public string Position   { get; init; } = string.Empty;
+    [JsonPropertyName("type")]        public string Type       { get; init; } = string.Empty;
+    [JsonPropertyName("zoom_factor")] public double ZoomFactor { get; init; } = 1.0;
 }

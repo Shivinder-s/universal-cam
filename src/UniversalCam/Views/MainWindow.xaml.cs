@@ -45,13 +45,28 @@ public sealed class BoolToAccentConverter : IValueConverter
 
 public sealed class CameraViewModel
 {
-    public string Id { get; set; } = string.Empty;
-    public string Name { get; set; } = string.Empty;
-    public string Position { get; set; } = string.Empty;
-    public bool IsSelected { get; set; }
+    public string Id          { get; set; } = string.Empty;
+    public string Name        { get; set; } = string.Empty;
+    public string Position    { get; set; } = string.Empty;
+    public string CameraType  { get; set; } = string.Empty;
+    public double ZoomFactor  { get; set; } = 1.0;
+    public bool   IsSelected  { get; set; }
 
-    /// Adds a lens-type emoji prefix for visual clarity in the sidebar.
-    public string DisplayName => Name;
+    public string DisplayName
+    {
+        get
+        {
+            string z = ZoomFactor.ToString("0.#");
+            return (CameraType, Position) switch
+            {
+                ("ultra_wide", _)    => $"Ultra Wide {z}×",
+                ("telephoto",  _)    => $"Telephoto {z}×",
+                ("true_depth", _)    => $"Selfie {z}×",
+                (_,         "front") => $"Selfie {z}×",
+                _                    => $"Wide {z}×",
+            };
+        }
+    }
 }
 
 // ── MainWindow ────────────────────────────────────────────────────────────────
@@ -163,6 +178,8 @@ public partial class MainWindow : Window
 
             if (state == TransportState.Connected)
             {
+                _rotation = 0;
+                imgRotation.Angle = 0;
                 txtDeviceName.Text = _cm?.DeviceName ?? "iPhone";
                 txtWaiting.Text = "Connected — waiting for stream…";
                 btnStop.IsEnabled = true;
@@ -175,7 +192,10 @@ public partial class MainWindow : Window
                 txtDeviceName.Text = "No device";
                 pnlNoStream.Visibility = Visibility.Visible;
                 imgPreview.Source = null;
-                icCameras.ItemsSource = null;
+                icBackCameras.ItemsSource = null;
+                icFrontCameras.ItemsSource = null;
+                pnlBack.Visibility  = Visibility.Collapsed;
+                pnlFront.Visibility = Visibility.Collapsed;
                 btnStop.IsEnabled = false;
                 btnMute.IsEnabled = false;
                 pbVolume.IsEnabled = false;
@@ -203,16 +223,23 @@ public partial class MainWindow : Window
             var vms = msg.Cameras
                 .Select(c => new CameraViewModel
                 {
-                    Id = c.Id,
-                    Name = c.Name,
-                    Position = c.Position,
+                    Id         = c.Id,
+                    Name       = c.Name,
+                    Position   = c.Position,
+                    CameraType = c.Type,
+                    ZoomFactor = c.ZoomFactor,
                     IsSelected = c.Id == msg.CurrentCameraId
                 })
                 .ToList();
 
-            icCameras.ItemsSource = vms;
+            var back  = vms.Where(c => c.Position == "back").ToList();
+            var front = vms.Where(c => c.Position is "front" or "unspecified").ToList();
 
-            // Update device name if ConnectionManager has it
+            icBackCameras.ItemsSource  = back;
+            icFrontCameras.ItemsSource = front;
+            pnlBack.Visibility  = back.Count  > 0 ? Visibility.Visible : Visibility.Collapsed;
+            pnlFront.Visibility = front.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
             if (_cm is not null && _cm.DeviceName is { Length: > 0 } name)
                 txtDeviceName.Text = name;
         });
