@@ -13,6 +13,7 @@ using UniversalCam.Core.Audio;
 using UniversalCam.Core.Protocol;
 using UniversalCam.Core.Transport;
 using UniversalCam.Core.Video;
+using UniversalCam.VirtualCamera;
 
 namespace UniversalCam.Views;
 
@@ -44,10 +45,10 @@ public sealed class BoolToAccentConverter : IValueConverter
 
 public sealed class CameraViewModel
 {
-    public string Id          { get; set; } = string.Empty;
-    public string Name        { get; set; } = string.Empty;
-    public string Position    { get; set; } = string.Empty;
-    public bool   IsSelected  { get; set; }
+    public string Id { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string Position { get; set; } = string.Empty;
+    public bool IsSelected { get; set; }
 
     /// Adds a lens-type emoji prefix for visual clarity in the sidebar.
     public string DisplayName => Name;
@@ -58,19 +59,20 @@ public sealed class CameraViewModel
 public partial class MainWindow : Window
 {
     private ConnectionManager? _cm;
-    private H264Decoder?       _decoder;
-    private AacDecoder?        _aacDecoder;
-    private AudioPlayer?       _audioPlayer;
+    private H264Decoder? _decoder;
+    private AacDecoder? _aacDecoder;
+    private AudioPlayer? _audioPlayer;
+    private VirtualCameraSession? _vCamSession;
 
-    private int              _frameWidth;
-    private int              _frameHeight;
+    private int _frameWidth;
+    private int _frameHeight;
     private WriteableBitmap? _bitmap;
-    private int              _rotation; // 0 / 90 / 180 / 270
+    private int _rotation; // 0 / 90 / 180 / 270
 
     private string _currentCameraId = string.Empty;
 
     private readonly DispatcherTimer _vuTimer = new()
-        { Interval = TimeSpan.FromMilliseconds(100) };
+    { Interval = TimeSpan.FromMilliseconds(100) };
 
     public MainWindow()
     {
@@ -87,8 +89,11 @@ public partial class MainWindow : Window
         _decoder = new H264Decoder();
         _decoder.FrameDecoded += OnFrameDecoded;
 
+        // Virtual camera (bridges decoded frames to system)
+        _vCamSession = new VirtualCameraSession();
+
         // Audio
-        _aacDecoder  = new AacDecoder();
+        _aacDecoder = new AacDecoder();
         _audioPlayer = new AudioPlayer();
         _aacDecoder.PcmDecoded += (_, pcm) => _audioPlayer.Feed(pcm);
 
@@ -102,9 +107,13 @@ public partial class MainWindow : Window
 
         // Connection
         _cm = new ConnectionManager();
-        _cm.StateChanged    += OnStateChanged;
-        _cm.FrameReceived   += OnMediaFrame;
+        _cm.StateChanged += OnStateChanged;
+        _cm.FrameReceived += OnMediaFrame;
         _cm.CamerasReceived += OnCamerasReceived;
+
+        // Wire virtual camera to decoder and connection state
+        _decoder.FrameDecoded += _vCamSession.OnFrameDecoded;
+        _cm.StateChanged += _vCamSession.OnConnectionStateChanged;
 
         txtIpHint.Text = GetLocalIpHint();
         UpdateStatus(TransportState.Idle, TransportType.None);
@@ -130,6 +139,9 @@ public partial class MainWindow : Window
             _cm = null;
         }
 
+        _vCamSession?.Dispose();
+        _vCamSession = null;
+
         _decoder?.Dispose();
         _decoder = null;
 
@@ -152,24 +164,24 @@ public partial class MainWindow : Window
             if (state == TransportState.Connected)
             {
                 txtDeviceName.Text = _cm?.DeviceName ?? "iPhone";
-                txtWaiting.Text    = "Connected — waiting for stream…";
-                btnStop.IsEnabled  = true;
-                btnMute.IsEnabled  = true;
+                txtWaiting.Text = "Connected — waiting for stream…";
+                btnStop.IsEnabled = true;
+                btnMute.IsEnabled = true;
                 pbVolume.IsEnabled = true;
                 _ = SendConfigureAndStartAsync();
             }
             else if (state is TransportState.Disconnected or TransportState.Idle)
             {
-                txtDeviceName.Text     = "No device";
+                txtDeviceName.Text = "No device";
                 pnlNoStream.Visibility = Visibility.Visible;
-                imgPreview.Source      = null;
-                icCameras.ItemsSource  = null;
-                btnStop.IsEnabled      = false;
-                btnMute.IsEnabled      = false;
-                pbVolume.IsEnabled     = false;
-                pbVolume.Value         = 0;
-                txtInfo.Text           = string.Empty;
-                txtLatency.Text        = string.Empty;
+                imgPreview.Source = null;
+                icCameras.ItemsSource = null;
+                btnStop.IsEnabled = false;
+                btnMute.IsEnabled = false;
+                pbVolume.IsEnabled = false;
+                pbVolume.Value = 0;
+                txtInfo.Text = string.Empty;
+                txtLatency.Text = string.Empty;
             }
         });
     }
@@ -191,9 +203,9 @@ public partial class MainWindow : Window
             var vms = msg.Cameras
                 .Select(c => new CameraViewModel
                 {
-                    Id         = c.Id,
-                    Name       = c.Name,
-                    Position   = c.Position,
+                    Id = c.Id,
+                    Name = c.Name,
+                    Position = c.Position,
                     IsSelected = c.Id == msg.CurrentCameraId
                 })
                 .ToList();
@@ -218,7 +230,7 @@ public partial class MainWindow : Window
 
             if (_bitmap is null || _frameWidth != frame.Width || _frameHeight != frame.Height)
             {
-                _frameWidth  = frame.Width;
+                _frameWidth = frame.Width;
                 _frameHeight = frame.Height;
                 _bitmap = new WriteableBitmap(
                     frame.Width, frame.Height,
@@ -283,9 +295,9 @@ public partial class MainWindow : Window
     private async Task SendConfigureAndStartAsync()
     {
         if (_cm is null) return;
-        bool is4K  = rb4K.IsChecked == true;
+        bool is4K = rb4K.IsChecked == true;
         string res = is4K ? "3840x2160" : "1920x1080";
-        int  rate  = is4K ? 25_000_000  : 8_000_000;
+        int rate = is4K ? 25_000_000 : 8_000_000;
         await _cm.ConfigureAsync(res, 30, "h264", rate);
     }
 
@@ -310,12 +322,12 @@ public partial class MainWindow : Window
     {
         (ellStatus.Fill, txtStatus.Text) = state switch
         {
-            TransportState.Idle         => (Brushes.Gray,       "Idle"),
-            TransportState.Listening    => (Brushes.DodgerBlue, "Searching…"),
-            TransportState.Connected    => (Brushes.LimeGreen,  "Connected"),
-            TransportState.Disconnected => (Brushes.Orange,     "Disconnected"),
-            TransportState.Error        => (Brushes.OrangeRed,  "Error"),
-            _                           => (Brushes.Gray,       state.ToString()),
+            TransportState.Idle => (Brushes.Gray, "Idle"),
+            TransportState.Listening => (Brushes.DodgerBlue, "Searching…"),
+            TransportState.Connected => (Brushes.LimeGreen, "Connected"),
+            TransportState.Disconnected => (Brushes.Orange, "Disconnected"),
+            TransportState.Error => (Brushes.OrangeRed, "Error"),
+            _ => (Brushes.Gray, state.ToString()),
         };
 
         if (type == TransportType.None)
