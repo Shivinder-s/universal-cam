@@ -14,7 +14,9 @@ internal sealed class MfMediaStream
 {
     private readonly MfMediaSourceWrapper _mediaSource;
     private readonly Queue<object> _eventQueue = new();
+#pragma warning disable CS0169 // Field used in Phase 2B when P/Invoke stubs are available
     private object? _mediaEventGenerator;  // IMFMediaEventGenerator once CsWin32 P/Invoke available
+#pragma warning restore CS0169
     private int _streamId;
     private bool _isActive = true;
     private bool _disposed;
@@ -37,25 +39,19 @@ internal sealed class MfMediaStream
         var frame = _mediaSource.GetNextFrame();
         if (frame != null)
         {
-            // TODO (Phase 2B): Once CsWin32 generates IMFSample P/Invoke:
-            // 1. Create IMFSample via MFCreateSample()
-            // 2. Create IMFMediaBuffer via MFCreateMemoryBuffer(frame.Data.Length)
-            // 3. Copy NV12 data into buffer
-            // 4. Set buffer length
-            // 5. Add buffer to sample
-            // 6. Set sample timestamp (frame.PtsUs * 10)
-            // 7. Return sample
+            // Phase 2B (P/Invoke Integration):
+            // Once MediaFoundationInterop.cs provides P/Invoke declarations,
+            // this will wrap the NV12Frame in an IMFSample:
             //
-            // Example (pseudocode once P/Invoke ready):
-            // var sample = MFCreateSample();
-            // var buffer = MFCreateMemoryBuffer((uint)frame.Data.Length);
+            // var sample = MediaFoundationInterop.MFCreateSample();
+            // var buffer = MediaFoundationInterop.MFCreateMemoryBuffer((uint)frame.Data.Length);
             // buffer.Lock(out var ptr, out var maxLen, out var curLen);
             // Marshal.Copy(frame.Data, 0, ptr, frame.Data.Length);
             // buffer.Unlock();
             // buffer.SetCurrentLength((uint)frame.Data.Length);
             // sample.AddBuffer(buffer);
             // sample.SetSampleTime(frame.PtsUs * 10);
-            // sample.SetSampleDuration(333333);  // 30fps = 333ms / 10000
+            // sample.SetSampleDuration(333333);  // 30fps
             // return sample;
         }
 
@@ -71,30 +67,19 @@ internal sealed class MfMediaStream
         if (_disposed)
             return;
 
-        // TODO (Phase 2B): Once CsWin32 generates IMFMediaEventGenerator P/Invoke:
-        // 1. Create media type with new dimensions and fps
-        // 2. Queue MEStreamFormatChanged event with media type
-        // 3. Fire event via _mediaEventGenerator
+        // Phase 2B (P/Invoke Integration):
+        // Once MediaFoundationInterop.cs provides IMFMediaType P/Invoke,
+        // this will signal MEStreamFormatChanged to consumers:
         //
-        // Example (pseudocode):
-        // var mediaType = MFCreateMediaType();
+        // var mediaType = MediaFoundationInterop.MFCreateMediaType();
         // mediaType.SetUINT32(MF_MT_FRAME_WIDTH, (uint)width);
         // mediaType.SetUINT32(MF_MT_FRAME_HEIGHT, (uint)height);
         // mediaType.SetUINT32(MF_MT_FRAME_RATE, (uint)fps);
-        // mediaType.SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        //
-        // _mediaEventGenerator.QueueEvent(
-        //     MEStreamFormatChanged,
-        //     GUID_NULL,
-        //     S_OK,
-        //     mediaType);
+        // mediaType.SetUINT32(MF_MT_SUBTYPE, 0x3231564E);  // NV12
+        // _mediaEventGenerator?.QueueEvent(MEStreamFormatChanged, ...);
 
         Console.WriteLine($"[MfMediaStream] Format changed: {width}×{height} @ {fps}fps");
     }
-
-    /// <summary>
-    /// Pauses stream (stops delivering samples).
-    /// </summary>
     public void Pause()
     {
         _isActive = false;
