@@ -21,4 +21,11 @@
     <ItemGroup>
         <ProjectReference Include="..\UniversalCam.Core\UniversalCam.Core.csproj" />
     </ItemGroup>
+
+    <ItemGroup>
+        <!-- Ensures native FFmpeg DLLs land next to UniversalCam.exe -->
+        <PackageReference Include="Sdcb.FFmpeg.runtime.windows-x64" Version="6.0.26" />
+        <!-- WASAPI audio output -->
+        <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
+    </ItemGroup>
 </Project>

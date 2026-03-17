@@ -1,38 +1,28 @@
 using System.Runtime.InteropServices;
+using Sdcb.FFmpeg.Codecs;
+using Sdcb.FFmpeg.Raw;
+using Sdcb.FFmpeg.Utils;
 using UniversalCam.Core.Protocol;
 
 namespace UniversalCam.Core.Video;
 
 /// <summary>
-/// Decodes H.264 Annex B NAL units (received from the iPhone) into
-/// BGRA32 software bitmaps using the Windows Media Foundation H.264 decoder MFT.
+/// Decodes H.264 Annex B NAL units (received from the iPhone) into BGRA32 frames
+/// using FFmpeg (Sdcb.FFmpeg) via the libavcodec H.264 software decoder.
 ///
-/// This is a thin P/Invoke wrapper. The MFT runs in software by default on all
-/// Windows 10+ machines; hardware decode (DXVA2 / D3D11-VA) can be layered on
-/// top later. Output is <see cref="DecodedFrame"/> which exposes a raw BGRA byte
-/// array suitable for WriteableBitmap / SwapChainPanel rendering.
-///
-/// Thread safety: Feed() must be called from a single thread. DecodedFrame events
-/// are raised on the same thread.
+/// Thread safety: Feed() must be called from a single thread.
+/// FrameDecoded events fire synchronously on that thread.
 /// </summary>
 public sealed class H264Decoder : IDisposable
 {
-    // ── Events ────────────────────────────────────────────────────────────────
-
-    /// Raised for each decoded video frame. The <see cref="DecodedFrame.Data"/>
-    /// buffer is only valid until the next Feed() call — copy it if you need it longer.
     public event EventHandler<DecodedFrame>? FrameDecoded;
 
-    // ── State ─────────────────────────────────────────────────────────────────
-
-    private MfDecoder? _decoder;
-    private bool       _initialized;
-
-    // ── Public API ────────────────────────────────────────────────────────────
+    private FfmpegDecoder? _decoder;
+    private bool           _initialized;
 
     /// <summary>
-    /// Feed one <see cref="MediaFrame"/> (H.264 Annex B payload) into the decoder.
-    /// Zero or more <see cref="FrameDecoded"/> events may fire synchronously.
+    /// Feed one H.264 Annex B <see cref="MediaFrame"/>. Zero or more
+    /// <see cref="FrameDecoded"/> events may fire synchronously.
     /// </summary>
     public void Feed(MediaFrame frame)
     {
@@ -40,7 +30,15 @@ public sealed class H264Decoder : IDisposable
 
         if (!_initialized)
         {
-            Initialize();
+            try
+            {
+                _decoder = new FfmpegDecoder();
+                _decoder.FrameDecoded += (_, f) => FrameDecoded?.Invoke(this, f);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[H264Decoder] Init failed: {ex.Message}");
+            }
             _initialized = true;
         }
 
@@ -52,40 +50,16 @@ public sealed class H264Decoder : IDisposable
         _decoder?.Dispose();
         _decoder = null;
     }
-
-    // ── Private ───────────────────────────────────────────────────────────────
-
-    private void Initialize()
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            Console.WriteLine("[H264Decoder] Not on Windows — decoder unavailable.");
-            return;
-        }
-
-        try
-        {
-            _decoder = new MfDecoder();
-            _decoder.FrameDecoded += (_, f) => FrameDecoded?.Invoke(this, f);
-            Console.WriteLine("[H264Decoder] Media Foundation H.264 decoder ready.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[H264Decoder] Init failed: {ex.Message}");
-        }
-    }
 }
 
-/// <summary>
-/// A decoded video frame in BGRA32 format, ready for WinUI rendering.
-/// </summary>
+/// <summary>A decoded video frame in BGRA32 format, ready for WPF WriteableBitmap rendering.</summary>
 public sealed class DecodedFrame
 {
     public int    Width  { get; }
     public int    Height { get; }
     public long   PtsUs  { get; }
 
-    /// BGRA32 raw pixels, Width * Height * 4 bytes.
+    /// BGRA32 pixels: Width * Height * 4 bytes.
     public byte[] Data   { get; }
 
     public DecodedFrame(int width, int height, long ptsUs, byte[] data)
@@ -98,33 +72,100 @@ public sealed class DecodedFrame
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Internal MF wrapper (software-only, no COM interop dependency for the app layer)
+// FFmpeg H.264 decoder (libavcodec via Sdcb.FFmpeg)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// <summary>
-/// Thin wrapper around the Windows Media Foundation H.264 software decoder MFT.
-/// Isolated here so that the rest of the codebase stays COM-free.
-///
-/// TODO (Phase 2): Replace with a proper MF COM P/Invoke or use
-/// Windows.Media.VideoEffects / SharpDX.MediaFoundation for hardware acceleration.
-/// For Phase 1, we write NAL units into a named pipe / temp file and use
-/// FFmpeg.AutoGen as an optional fallback if available.
-/// </summary>
-internal sealed class MfDecoder : IDisposable
+internal sealed class FfmpegDecoder : IDisposable
 {
     public event EventHandler<DecodedFrame>? FrameDecoded;
 
-    // Phase 1 stub: outputs an empty 1×1 frame to keep the pipeline wired.
-    // Replace the body of Decode() with real MFT calls in Phase 2.
-    public void Decode(byte[] annexBNalUnits, long ptsUs, bool isKeyframe)
+    private readonly CodecContext _codecCtx;
+    private readonly Frame        _yuvFrame;
+
+    public FfmpegDecoder()
     {
-        // TODO Phase 2: push annexBNalUnits into MFT input stream,
-        //               drain MFT output stream, convert IMFSample → byte[].
-        //
-        // For now, emit a placeholder so the event pipeline is testable.
-        // The WinUI preview layer handles a 1×1 frame gracefully (blank screen).
-        FrameDecoded?.Invoke(this, new DecodedFrame(1, 1, ptsUs, new byte[4]));
+        var codec = Codec.FindDecoderById(Sdcb.FFmpeg.Raw.AVCodecID.H264);
+        _codecCtx = new CodecContext(codec);
+        _codecCtx.Open(codec);
+        _yuvFrame = new Frame();
     }
 
-    public void Dispose() { /* TODO: release MFT COM objects */ }
+    public unsafe void Decode(byte[] annexBNalUnits, long ptsUs, bool isKeyframe)
+    {
+        using var packet = new Packet();
+        AVPacket* raw = packet;
+
+        // Allocate an FFmpeg-managed buffer so av_packet_free can safely release it.
+        if (ffmpeg.av_new_packet(raw, annexBNalUnits.Length) < 0) return;
+        Marshal.Copy(annexBNalUnits, 0, (nint)raw->data, annexBNalUnits.Length);
+        raw->pts = ptsUs;
+
+        try { _codecCtx.SendPacket(packet); }
+        catch { return; } // skip corrupt/invalid input silently
+
+        while (true)
+        {
+            var result = _codecCtx.ReceiveFrame(_yuvFrame);
+            if (result == CodecResult.Again || result == CodecResult.EOF) break;
+            if ((int)result < 0) break; // skip other errors silently
+
+            EmitFrame(ptsUs);
+            _yuvFrame.Unref();
+        }
+    }
+
+    private unsafe void EmitFrame(long ptsUs)
+    {
+        int w = _yuvFrame.Width;
+        int h = _yuvFrame.Height;
+        if (w <= 0 || h <= 0) return;
+
+        byte[] output = new byte[w * h * 4];
+
+        // YUV420p → BGRA32 in-place (BT.601 full-range coefficients)
+        byte* yPlane = (byte*)_yuvFrame.Data[0];
+        byte* uPlane = (byte*)_yuvFrame.Data[1];
+        byte* vPlane = (byte*)_yuvFrame.Data[2];
+        int   yStride = _yuvFrame.Linesize[0];
+        int   uStride = _yuvFrame.Linesize[1];
+
+        fixed (byte* dst = output)
+        {
+            for (int row = 0; row < h; row++)
+            {
+                int uvRow = row >> 1;
+                byte* yRow  = yPlane + row   * yStride;
+                byte* uRow  = uPlane + uvRow * uStride;
+                byte* vRow  = vPlane + uvRow * uStride;
+                byte* dstRow = dst + row * w * 4;
+
+                for (int col = 0; col < w; col++)
+                {
+                    int Y = yRow[col];
+                    int U = uRow[col >> 1] - 128;
+                    int V = vRow[col >> 1] - 128;
+
+                    int R = Clamp(Y + (V * 45941 >> 15));
+                    int G = Clamp(Y - (U * 11277 >> 15) - (V * 23401 >> 15));
+                    int B = Clamp(Y + (U * 58065 >> 15));
+
+                    int o = col * 4;
+                    dstRow[o + 0] = (byte)B;
+                    dstRow[o + 1] = (byte)G;
+                    dstRow[o + 2] = (byte)R;
+                    dstRow[o + 3] = 0xFF;
+                }
+            }
+        }
+
+        FrameDecoded?.Invoke(this, new DecodedFrame(w, h, ptsUs, output));
+    }
+
+    private static int Clamp(int v) => v < 0 ? 0 : v > 255 ? 255 : v;
+
+    public void Dispose()
+    {
+        _yuvFrame.Dispose();
+        _codecCtx.Dispose();
+    }
 }

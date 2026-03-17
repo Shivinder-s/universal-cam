@@ -2,7 +2,10 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using UniversalCam.Audio;
 using UniversalCam.Core;
+using UniversalCam.Core.Audio;
 using UniversalCam.Core.Protocol;
 using UniversalCam.Core.Transport;
 using UniversalCam.Core.Video;
@@ -13,29 +16,49 @@ public partial class MainWindow : Window
 {
     private ConnectionManager? _cm;
     private H264Decoder?       _decoder;
+    private AacDecoder?        _aacDecoder;
+    private AudioPlayer?       _audioPlayer;
 
     private int              _frameWidth;
     private int              _frameHeight;
     private WriteableBitmap? _bitmap;
 
+    private readonly DispatcherTimer _vuTimer = new()
+        { Interval = TimeSpan.FromMilliseconds(100) };
+
     public MainWindow()
     {
         InitializeComponent();
-        Loaded   += OnLoaded;
-        Closed   += OnClosed;
+        Loaded += OnLoaded;
+        Closed += OnClosed;
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
+        // Video
         _decoder = new H264Decoder();
         _decoder.FrameDecoded += OnFrameDecoded;
 
+        // Audio
+        _aacDecoder  = new AacDecoder();
+        _audioPlayer = new AudioPlayer();
+        _aacDecoder.PcmDecoded += (_, pcm) => _audioPlayer.Feed(pcm);
+
+        // VU meter timer
+        _vuTimer.Tick += (_, _) =>
+        {
+            if (_audioPlayer is not null && pbVolume.IsEnabled)
+                pbVolume.Value = _audioPlayer.CurrentRms;
+        };
+        _vuTimer.Start();
+
+        // Connection
         _cm = new ConnectionManager();
-        _cm.StateChanged     += OnStateChanged;
-        _cm.FrameReceived    += OnMediaFrame;
-        _cm.CamerasReceived  += OnCamerasReceived;
+        _cm.StateChanged    += OnStateChanged;
+        _cm.FrameReceived   += OnMediaFrame;
+        _cm.CamerasReceived += OnCamerasReceived;
 
         UpdateStatus(TransportState.Idle, TransportType.None);
 
@@ -51,14 +74,23 @@ public partial class MainWindow : Window
 
     private async void OnClosed(object? sender, EventArgs e)
     {
+        _vuTimer.Stop();
+
         if (_cm is not null)
         {
             await _cm.StopStreamAsync();
             await _cm.DisposeAsync();
             _cm = null;
         }
+
         _decoder?.Dispose();
         _decoder = null;
+
+        _aacDecoder?.Dispose();
+        _aacDecoder = null;
+
+        _audioPlayer?.Dispose();
+        _audioPlayer = null;
     }
 
     // ── Transport events (background thread) ─────────────────────────────────
@@ -72,8 +104,10 @@ public partial class MainWindow : Window
 
             if (state == TransportState.Connected)
             {
-                txtWaiting.Text   = "Connected — waiting for stream…";
-                btnStop.IsEnabled = true;
+                txtWaiting.Text    = "Connected — waiting for stream…";
+                btnStop.IsEnabled  = true;
+                btnMute.IsEnabled  = true;
+                pbVolume.IsEnabled = true;
                 _ = SendConfigureAndStartAsync();
             }
             else if (state is TransportState.Disconnected or TransportState.Idle)
@@ -82,6 +116,9 @@ public partial class MainWindow : Window
                 imgPreview.Source      = null;
                 btnFlip.IsEnabled      = false;
                 btnStop.IsEnabled      = false;
+                btnMute.IsEnabled      = false;
+                pbVolume.IsEnabled     = false;
+                pbVolume.Value         = 0;
                 txtInfo.Text           = string.Empty;
             }
         });
@@ -91,7 +128,8 @@ public partial class MainWindow : Window
     {
         if (frame.IsVideo)
             _decoder?.Feed(frame);
-        // Audio: TODO route to WASAPI output
+        else if (frame.IsAudio)
+            _aacDecoder?.Decode(frame.Payload, frame.Header.PtsUs);
     }
 
     private void OnCamerasReceived(object? sender, AvailableCameras msg)
@@ -108,11 +146,10 @@ public partial class MainWindow : Window
     {
         Dispatcher.BeginInvoke(() =>
         {
-            if (frame.Width <= 1) return; // Phase 1 stub frame
+            if (frame.Width <= 1) return;
 
             pnlNoStream.Visibility = Visibility.Collapsed;
 
-            // Re-create bitmap only when resolution changes
             if (_bitmap is null || _frameWidth != frame.Width || _frameHeight != frame.Height)
             {
                 _frameWidth  = frame.Width;
@@ -126,7 +163,6 @@ public partial class MainWindow : Window
                 txtInfo.Text = $"{frame.Width}×{frame.Height}";
             }
 
-            // Write BGRA pixels directly into the back buffer
             _bitmap.Lock();
             Marshal.Copy(frame.Data, 0, _bitmap.BackBuffer, frame.Data.Length);
             _bitmap.AddDirtyRect(new System.Windows.Int32Rect(0, 0, frame.Width, frame.Height));
@@ -149,6 +185,12 @@ public partial class MainWindow : Window
         btnStop.IsEnabled = false;
     }
 
+    private void OnMuteClicked(object sender, RoutedEventArgs e)
+    {
+        if (_audioPlayer is null) return;
+        _audioPlayer.IsMuted = btnMute.IsChecked ?? false;
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task SendConfigureAndStartAsync()
@@ -161,12 +203,12 @@ public partial class MainWindow : Window
     {
         (ellStatus.Fill, txtStatus.Text) = state switch
         {
-            TransportState.Idle         => (Brushes.Gray,        "Idle"),
-            TransportState.Listening    => (Brushes.DodgerBlue,  "Waiting for iPhone…"),
-            TransportState.Connected    => (Brushes.LimeGreen,   "Connected"),
-            TransportState.Disconnected => (Brushes.Orange,      "Disconnected"),
-            TransportState.Error        => (Brushes.OrangeRed,   "Error"),
-            _                           => (Brushes.Gray,        state.ToString()),
+            TransportState.Idle         => (Brushes.Gray,       "Idle"),
+            TransportState.Listening    => (Brushes.DodgerBlue, "Waiting for iPhone…"),
+            TransportState.Connected    => (Brushes.LimeGreen,  "Connected"),
+            TransportState.Disconnected => (Brushes.Orange,     "Disconnected"),
+            TransportState.Error        => (Brushes.OrangeRed,  "Error"),
+            _                           => (Brushes.Gray,       state.ToString()),
         };
 
         if (type == TransportType.None)
@@ -175,8 +217,8 @@ public partial class MainWindow : Window
         }
         else
         {
-            badgeTransport.Visibility  = Visibility.Visible;
-            badgeTransport.Background  = type == TransportType.USB
+            badgeTransport.Visibility = Visibility.Visible;
+            badgeTransport.Background = type == TransportType.USB
                 ? (Brush)Application.Current.Resources["UsbBadgeBrush"]
                 : (Brush)Application.Current.Resources["WifiBadgeBrush"];
             txtTransport.Text = type.ToString();
