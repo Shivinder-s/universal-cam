@@ -97,15 +97,6 @@ final class QuicTransport {
             if case .failed = state { self?.scheduleReconnect() }
         }
 
-        // Handle server-initiated streams (e.g., Welcome message from Windows).
-        // Without this, NWConnection silently discards incoming QUIC streams opened
-        // by the remote side — the app never sees Welcome and the handshake stalls.
-        conn.newConnectionHandler = { [weak self] incomingStream in
-            guard let self else { return }
-            incomingStream.start(queue: self.queue)
-            self.receiveLoop(incomingStream)
-        }
-
         conn.start(queue: queue)
         receiveLoop(conn)
     }
