@@ -30,7 +30,7 @@ public sealed class QuicServer : ITransport
 
     private QuicListener?   _listener;
     private QuicConnection? _connection;
-    private QuicStream?     _controlStream; // persistent PC→iPhone unidirectional stream
+    private QuicStream?     _responseStream; // the bidirectional stream iOS opened; we write back on it
     private readonly FrameParser _parser = new();
     private CancellationTokenSource? _cts;
 
@@ -79,7 +79,7 @@ public sealed class QuicServer : ITransport
 
     public async Task SendControlAsync(ControlMessage message, CancellationToken ct = default)
     {
-        if (_controlStream is null) return;
+        if (_responseStream is null) return;
         try
         {
             var json = message.ToJsonBytes();
@@ -87,8 +87,8 @@ public sealed class QuicServer : ITransport
             packet[0] = FrameHeader.StreamTypeControl;
             json.CopyTo(packet, 1);
             packet[^1] = 0x0A;
-            await _controlStream.WriteAsync(packet, ct);
-            await _controlStream.FlushAsync(ct);
+            await _responseStream.WriteAsync(packet, ct);
+            await _responseStream.FlushAsync(ct);
         }
         catch (Exception ex)
         {
@@ -107,30 +107,16 @@ public sealed class QuicServer : ITransport
                 var connection = await _listener.AcceptConnectionAsync(ct);
                 Console.WriteLine($"[QuicServer] iPhone connected: {connection.RemoteEndPoint}");
 
-                // Only one connection at a time — close old control stream + connection
-                _controlStream?.DisposeAsync().AsTask().Forget();
-                _controlStream = null;
+                // Only one connection at a time
+                _responseStream?.DisposeAsync().AsTask().Forget();
+                _responseStream = null;
                 _connection?.CloseAsync(0).AsTask().Forget();
                 _connection = connection;
 
-                // Open persistent unidirectional stream for all PC→iPhone control messages.
-                // iOS advertises initialMaxStreamsUnidirectional=100, so this succeeds immediately.
-                try
-                {
-                    _controlStream = await connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, ct);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[QuicServer] Failed to open control stream: {ex.Message}");
-                    SetState(TransportState.Error);
-                    continue;
-                }
-
                 SetState(TransportState.Connected);
 
-                // Initiate handshake: iOS waits for welcome before sending hello
-                _ = SendControlAsync(new Welcome());
-
+                // iOS sends Hello on a bidirectional stream immediately on .ready.
+                // We accept that stream and write Configure/StartStream back on it.
                 _ = ReadStreamsAsync(connection, ct);
             }
         }
@@ -149,6 +135,9 @@ public sealed class QuicServer : ITransport
             while (!ct.IsCancellationRequested)
             {
                 var stream = await connection.AcceptInboundStreamAsync(ct);
+                // Use the first writable (bidirectional) stream iOS opened as the response channel.
+                if (_responseStream is null && stream.CanWrite)
+                    _responseStream = stream;
                 _ = ReadStreamAsync(stream, ct);
             }
         }
@@ -156,8 +145,11 @@ public sealed class QuicServer : ITransport
         catch (Exception ex)
         {
             Console.WriteLine($"[QuicServer] Stream accept error: {ex.Message}");
-            SetState(TransportState.Disconnected);
-            _parser.Reset();
+            if (connection == _connection)
+            {
+                SetState(TransportState.Disconnected);
+                _parser.Reset();
+            }
         }
     }
 
@@ -215,7 +207,7 @@ public sealed class QuicServer : ITransport
     public async ValueTask DisposeAsync()
     {
         _cts?.Cancel();
-        if (_controlStream is not null) await _controlStream.DisposeAsync();
+        if (_responseStream is not null) await _responseStream.DisposeAsync();
         if (_connection    is not null) await _connection.CloseAsync(0);
         if (_listener      is not null) await _listener.DisposeAsync();
     }
