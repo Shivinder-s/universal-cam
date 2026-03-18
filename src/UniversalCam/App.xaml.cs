@@ -6,10 +6,12 @@ namespace UniversalCam;
 public partial class App : System.Windows.Application
 {
     private static Mutex? _instanceMutex;
+    private static bool _ownsMutex;
 
     protected override void OnStartup(System.Windows.StartupEventArgs e)
     {
         _instanceMutex = new Mutex(true, "UniversalCam_SingleInstance", out bool isNew);
+        _ownsMutex = isNew;
         if (!isNew)
         {
             MessageBox.Show("UniversalCam is already running.", "UniversalCam",
@@ -30,7 +32,7 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(System.Windows.ExitEventArgs e)
     {
-        _instanceMutex?.ReleaseMutex();
+        if (_ownsMutex) _instanceMutex?.ReleaseMutex();
         base.OnExit(e);
     }
 }

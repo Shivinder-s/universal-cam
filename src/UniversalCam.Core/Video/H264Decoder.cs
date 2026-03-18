@@ -82,6 +82,10 @@ internal sealed class FfmpegDecoder : IDisposable
     private readonly CodecContext _codecCtx;
     private readonly Frame        _yuvFrame;
 
+    private nint _swsCtx;            // SwsContext* stored as nint (0 = null)
+    private int  _swsW, _swsH;
+    private int  _swsFmt = -1;
+
     public FfmpegDecoder()
     {
         var codec = Codec.FindDecoderById(Sdcb.FFmpeg.Raw.AVCodecID.H264);
@@ -116,55 +120,53 @@ internal sealed class FfmpegDecoder : IDisposable
 
     private unsafe void EmitFrame(long ptsUs)
     {
-        int w = _yuvFrame.Width;
-        int h = _yuvFrame.Height;
+        int w   = _yuvFrame.Width;
+        int h   = _yuvFrame.Height;
+        int fmt = _yuvFrame.Format;
         if (w <= 0 || h <= 0) return;
+
+        // Lazily create/recreate sws context on dimension or format change.
+        // sws_scale handles BT.709 color matrix for HD content and respects SAR.
+        if (_swsCtx == 0 || _swsW != w || _swsH != h || _swsFmt != fmt)
+        {
+            if (_swsCtx != 0) ffmpeg.sws_freeContext((SwsContext*)_swsCtx);
+            var ctx = ffmpeg.sws_getContext(
+                w, h, (AVPixelFormat)fmt,
+                w, h, AVPixelFormat.Bgra,
+                (int)SWS.Bilinear, null, null, null);
+            _swsCtx = (nint)ctx;
+            _swsW   = w;
+            _swsH   = h;
+            _swsFmt = fmt;
+        }
 
         byte[] output = new byte[w * h * 4];
 
-        // YUV420p → BGRA32 in-place (BT.601 full-range coefficients)
-        byte* yPlane = (byte*)_yuvFrame.Data[0];
-        byte* uPlane = (byte*)_yuvFrame.Data[1];
-        byte* vPlane = (byte*)_yuvFrame.Data[2];
-        int   yStride = _yuvFrame.Linesize[0];
-        int   uStride = _yuvFrame.Linesize[1];
+        // FFmpeg reads up to AV_NUM_DATA_POINTERS (8) elements — must use 8-element arrays.
+        var srcSlice  = new byte*[8];
+        var srcStride = new int[8];
+        srcSlice[0] = (byte*)_yuvFrame.Data[0];
+        srcSlice[1] = (byte*)_yuvFrame.Data[1];
+        srcSlice[2] = (byte*)_yuvFrame.Data[2];
+        srcStride[0] = _yuvFrame.Linesize[0];
+        srcStride[1] = _yuvFrame.Linesize[1];
+        srcStride[2] = _yuvFrame.Linesize[2];
 
         fixed (byte* dst = output)
         {
-            for (int row = 0; row < h; row++)
-            {
-                int uvRow = row >> 1;
-                byte* yRow  = yPlane + row   * yStride;
-                byte* uRow  = uPlane + uvRow * uStride;
-                byte* vRow  = vPlane + uvRow * uStride;
-                byte* dstRow = dst + row * w * 4;
-
-                for (int col = 0; col < w; col++)
-                {
-                    int Y = yRow[col];
-                    int U = uRow[col >> 1] - 128;
-                    int V = vRow[col >> 1] - 128;
-
-                    int R = Clamp(Y + (V * 45941 >> 15));
-                    int G = Clamp(Y - (U * 11277 >> 15) - (V * 23401 >> 15));
-                    int B = Clamp(Y + (U * 58065 >> 15));
-
-                    int o = col * 4;
-                    dstRow[o + 0] = (byte)B;
-                    dstRow[o + 1] = (byte)G;
-                    dstRow[o + 2] = (byte)R;
-                    dstRow[o + 3] = 0xFF;
-                }
-            }
+            var dstSlice  = new byte*[8];
+            var dstStride = new int[8];
+            dstSlice[0]  = dst;
+            dstStride[0] = w * 4;
+            ffmpeg.sws_scale((SwsContext*)_swsCtx, srcSlice, srcStride, 0, h, dstSlice, dstStride);
         }
 
         FrameDecoded?.Invoke(this, new DecodedFrame(w, h, ptsUs, output));
     }
 
-    private static int Clamp(int v) => v < 0 ? 0 : v > 255 ? 255 : v;
-
-    public void Dispose()
+    public unsafe void Dispose()
     {
+        if (_swsCtx != 0) { ffmpeg.sws_freeContext((SwsContext*)_swsCtx); _swsCtx = 0; }
         _yuvFrame.Dispose();
         _codecCtx.Dispose();
     }

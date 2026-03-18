@@ -158,7 +158,8 @@ public sealed class ConnectionManager : IAsyncDisposable
 
     private void OnControlMessage(ITransport transport, TransportType type, ControlMessage msg)
     {
-        Console.WriteLine($"[ConnectionManager] {type} control: {msg.Type}");
+        if (msg is not Ping and not Pong)
+            Console.WriteLine($"[ConnectionManager] {type} control: {msg.Type}");
 
         switch (msg)
         {
@@ -166,8 +167,10 @@ public sealed class ConnectionManager : IAsyncDisposable
                 Console.WriteLine($"  Device: {hello.DeviceName}, capabilities: [{string.Join(", ", hello.Capabilities)}]");
                 DeviceName = hello.DeviceName;
 
-                // Promote this transport to active if not already set
-                if (_active is null)
+                // USB always wins over WiFi; WiFi only wins if nothing connected yet.
+                bool shouldPromote = _active is null
+                    || (ActiveTransport == TransportType.WiFi && type == TransportType.USB);
+                if (shouldPromote)
                 {
                     _active         = transport;
                     ActiveTransport = type;
@@ -186,8 +189,7 @@ public sealed class ConnectionManager : IAsyncDisposable
                 break;
 
             case Pong pong:
-                var rtt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - pong.Ts;
-                Console.WriteLine($"  RTT: {rtt} ms");
+                // RTT = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - pong.Ts (available if needed)
                 break;
 
             case Ping ping:

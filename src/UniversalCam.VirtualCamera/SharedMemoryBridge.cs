@@ -12,7 +12,7 @@ namespace UniversalCam.VirtualCamera;
 public sealed class SharedMemoryBridge : IDisposable
 {
     private const string MemoryMappedFileName = "UniversalCam_VCam_Frame";
-    private const int MaxFrameSize = 1920 * 1080 * 2;  // Generous upper bound for NV12
+    private const int MaxFrameSize = 3840 * 2160 * 2;  // Upper bound for 4K NV12
     private const int HeaderSize = 64;  // Enough for metadata
     private const int TotalSize = HeaderSize + MaxFrameSize;
 

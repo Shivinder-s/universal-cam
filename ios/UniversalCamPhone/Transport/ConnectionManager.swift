@@ -370,7 +370,11 @@ final class ConnectionManager: ObservableObject {
     func handleIncomingControl(_ message: ControlMessage, from transport: TransportType) {
         switch message {
         case .welcome:
-            // Set the active transport to whichever sent the welcome
+            // USB always wins; WiFi only wins if USB hasn't connected yet.
+            // This prevents a QUIC welcome (arriving after USB welcome) from
+            // flipping activeTransport back to WiFi and desyncing Windows.
+            let incomingIsUSB = (transport == .usb)
+            guard activeTransport == nil || incomingIsUSB else { break }
             activeTransport = transport
 
             let hello = ControlMessage.hello(

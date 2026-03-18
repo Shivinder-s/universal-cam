@@ -83,6 +83,7 @@ public partial class MainWindow : Window
     private int _frameHeight;
     private WriteableBitmap? _bitmap;
     private int _rotation; // 0 / 90 / 180 / 270
+    private int _pendingFrame; // 0 = idle, 1 = frame queued — used to drop stale frames
 
     private string _currentCameraId = string.Empty;
 
@@ -249,8 +250,14 @@ public partial class MainWindow : Window
 
     private void OnFrameDecoded(object? sender, DecodedFrame frame)
     {
+        // Drop frame if the UI thread already has one queued — keeps latency minimal.
+        if (System.Threading.Interlocked.CompareExchange(ref _pendingFrame, 1, 0) != 0)
+            return;
+
         Dispatcher.BeginInvoke(() =>
         {
+            System.Threading.Interlocked.Exchange(ref _pendingFrame, 0);
+
             if (frame.Width <= 1) return;
 
             pnlNoStream.Visibility = Visibility.Collapsed;
