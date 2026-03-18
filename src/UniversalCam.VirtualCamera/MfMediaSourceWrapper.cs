@@ -235,11 +235,22 @@ internal sealed class MfMediaSourceWrapper : IMFMediaSource, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Shutdown BEFORE releasing — cancels any pending BeginGetEvent callbacks so
+        // MF native threads stop calling into this managed COM object. Without this,
+        // a queued MF event fires on an unregistered native thread → 0x80131506 CLR fatal.
+        if (!_isShutdown)
+        {
+            _isShutdown = true;
+            try { _mediaStream?.Shutdown(); } catch { }
+            try { _eventQueue?.Shutdown(); }  catch { }
+        }
+
         _mediaStream?.Dispose();
         _frameBuffer.Clear();
         if (_eventQueue != null)
         {
-            Marshal.ReleaseComObject(_eventQueue);
+            try { Marshal.ReleaseComObject(_eventQueue); } catch { }
             _eventQueue = null;
         }
     }

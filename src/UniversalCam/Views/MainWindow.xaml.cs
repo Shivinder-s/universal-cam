@@ -23,7 +23,7 @@ public sealed class BoolToHighlightConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture) =>
         value is true
-            ? new SolidColorBrush(Color.FromRgb(0x3E, 0x3E, 0x42))
+            ? new SolidColorBrush(Color.FromRgb(0x3A, 0x3A, 0x3C))
             : Brushes.Transparent;
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>
@@ -34,8 +34,8 @@ public sealed class BoolToAccentConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture) =>
         value is true
-            ? new SolidColorBrush(Color.FromRgb(0x51, 0x2B, 0xD4))
-            : new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55));
+            ? new SolidColorBrush(Color.FromRgb(0x0A, 0x84, 0xFF))   // iOS blue
+            : new SolidColorBrush(Color.FromRgb(0x48, 0x48, 0x4A));  // iOS tertiary
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>
         throw new NotSupportedException();
@@ -82,13 +82,24 @@ public partial class MainWindow : Window
     private int _frameWidth;
     private int _frameHeight;
     private WriteableBitmap? _bitmap;
-    private int _rotation; // 0 / 90 / 180 / 270
-    private int _pendingFrame; // 0 = idle, 1 = frame queued — used to drop stale frames
+    private int _rotation;
+
+    // ── Render-level drop guard: skip Dispatcher if a frame is already queued ──
+    private int _pendingFrame;
+
+    // ── Decode-level drop guard: always decode only the newest received frame ──
+    private volatile MediaFrame? _latestVideoFrame;
+    private int _decoderRunning;
 
     private string _currentCameraId = string.Empty;
 
-    private readonly DispatcherTimer _vuTimer = new()
-    { Interval = TimeSpan.FromMilliseconds(100) };
+    // Debounce Configure sends: WiFi+USB hellos arrive within ~50 ms of each other,
+    // causing two Connected events and two Configure messages. Cancel the first and
+    // let the second win so we send exactly one Configure on the active transport.
+    private CancellationTokenSource? _configCts;
+
+    private readonly DispatcherTimer _vuTimer = new() { Interval = TimeSpan.FromMilliseconds(80) };
+    private readonly DispatcherTimer _pingTimer = new() { Interval = TimeSpan.FromSeconds(1) };
 
     public MainWindow()
     {
@@ -101,19 +112,15 @@ public partial class MainWindow : Window
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
-        // Video
         _decoder = new H264Decoder();
         _decoder.FrameDecoded += OnFrameDecoded;
 
-        // Virtual camera (bridges decoded frames to system)
         _vCamSession = new VirtualCameraSession();
 
-        // Audio
-        _aacDecoder = new AacDecoder();
+        _aacDecoder  = new AacDecoder();
         _audioPlayer = new AudioPlayer();
         _aacDecoder.PcmDecoded += (_, pcm) => _audioPlayer.Feed(pcm);
 
-        // VU meter timer
         _vuTimer.Tick += (_, _) =>
         {
             if (_audioPlayer is not null && pbVolume.IsEnabled)
@@ -121,32 +128,37 @@ public partial class MainWindow : Window
         };
         _vuTimer.Start();
 
-        // Connection
-        _cm = new ConnectionManager();
-        _cm.StateChanged += OnStateChanged;
-        _cm.FrameReceived += OnMediaFrame;
-        _cm.CamerasReceived += OnCamerasReceived;
+        _pingTimer.Tick += (_, _) => _ = _cm?.PingAsync();
 
-        // Wire virtual camera to decoder and connection state
+        _cm = new ConnectionManager();
+        _cm.StateChanged    += OnStateChanged;
+        _cm.FrameReceived   += OnMediaFrame;
+        _cm.CamerasReceived += OnCamerasReceived;
+        _cm.LatencyUpdated  += OnLatencyUpdated;
+        _cm.CameraSwitched  += (_, _) => _decoder?.Reset();
+
         _decoder.FrameDecoded += _vCamSession.OnFrameDecoded;
-        _cm.StateChanged += _vCamSession.OnConnectionStateChanged;
+        _cm.StateChanged      += _vCamSession.OnConnectionStateChanged;
 
         txtIpHint.Text = GetLocalIpHint();
         UpdateStatus(TransportState.Idle, TransportType.None);
 
-        try
-        {
-            await _cm.StartAsync();
-        }
-        catch (Exception ex)
-        {
-            txtWaiting.Text = $"Startup error: {ex.Message}";
-        }
+        try   { await _cm.StartAsync(); }
+        catch (Exception ex) { txtWaiting.Text = $"Startup error: {ex.Message}"; }
     }
 
     private async void OnClosed(object? sender, EventArgs e)
     {
+        _pingTimer.Stop();
         _vuTimer.Stop();
+        _configCts?.Cancel();
+
+        // Stop feeding new frames and wait for any in-flight drain task to exit
+        // before disposing the FFmpeg codec context — without this, avcodec_receive_frame
+        // can be called on a freed AVCodecContext → AccessViolationException.
+        _latestVideoFrame = null;
+        while (System.Threading.Interlocked.CompareExchange(ref _decoderRunning, 0, 0) != 0)
+            await Task.Delay(5);
 
         if (_cm is not null)
         {
@@ -156,19 +168,12 @@ public partial class MainWindow : Window
         }
 
         _vCamSession?.Dispose();
-        _vCamSession = null;
-
         _decoder?.Dispose();
-        _decoder = null;
-
         _aacDecoder?.Dispose();
-        _aacDecoder = null;
-
         _audioPlayer?.Dispose();
-        _audioPlayer = null;
     }
 
-    // ── Transport events (background thread) ──────────────────────────────────
+    // ── Transport events ──────────────────────────────────────────────────────
 
     private void OnStateChanged(object? sender, TransportState state)
     {
@@ -182,27 +187,37 @@ public partial class MainWindow : Window
                 _rotation = 0;
                 imgRotation.Angle = 0;
                 txtDeviceName.Text = _cm?.DeviceName ?? "iPhone";
-                txtWaiting.Text = "Connected — waiting for stream…";
-                btnStop.IsEnabled = true;
+                txtWaiting.Text   = "Connected — waiting for stream…";
                 btnMute.IsEnabled = true;
                 pbVolume.IsEnabled = true;
-                _ = SendConfigureAndStartAsync();
+                _pingTimer.Start();
+                _configCts?.Cancel();
+                _configCts = new CancellationTokenSource();
+                var cts = _configCts;
+                _ = Task.Run(async () =>
+                {
+                    try { await Task.Delay(120, cts.Token); }
+                    catch (OperationCanceledException) { return; }
+                    await Dispatcher.InvokeAsync(() => _ = SendConfigureAndStartAsync());
+                });
             }
             else if (state is TransportState.Disconnected or TransportState.Idle)
             {
+                _pingTimer.Stop();
                 txtDeviceName.Text = "No device";
-                pnlNoStream.Visibility = Visibility.Visible;
-                imgPreview.Source = null;
-                icBackCameras.ItemsSource = null;
+                pnlNoStream.Visibility    = Visibility.Visible;
+                pnlVideoInfo.Visibility   = Visibility.Collapsed;
+                imgPreview.Source         = null;
+                icBackCameras.ItemsSource  = null;
                 icFrontCameras.ItemsSource = null;
-                pnlBack.Visibility  = Visibility.Collapsed;
-                pnlFront.Visibility = Visibility.Collapsed;
-                btnStop.IsEnabled = false;
-                btnMute.IsEnabled = false;
-                pbVolume.IsEnabled = false;
-                pbVolume.Value = 0;
-                txtInfo.Text = string.Empty;
-                txtLatency.Text = string.Empty;
+                pnlBack.Visibility   = Visibility.Collapsed;
+                pnlFront.Visibility  = Visibility.Collapsed;
+                btnMute.IsEnabled    = false;
+                pbVolume.IsEnabled   = false;
+                pbVolume.Value       = 0;
+                txtInfo.Text         = string.Empty;
+                txtLatency.Text      = string.Empty;
+                txtInfoSep.Visibility = Visibility.Collapsed;
             }
         });
     }
@@ -210,9 +225,37 @@ public partial class MainWindow : Window
     private void OnMediaFrame(object? sender, MediaFrame frame)
     {
         if (frame.IsVideo)
-            _decoder?.Feed(frame);
+        {
+            // Overwrite with newest frame — the decode task will pick it up.
+            // Older frames that haven't been decoded yet are silently replaced,
+            // ensuring we always decode the freshest data even during bursts.
+            _latestVideoFrame = frame;
+            if (System.Threading.Interlocked.CompareExchange(ref _decoderRunning, 1, 0) == 0)
+                System.Threading.Tasks.Task.Run(DrainVideoFrames);
+        }
         else if (frame.IsAudio)
+        {
             _aacDecoder?.Decode(frame.Payload, frame.Header.PtsUs);
+        }
+    }
+
+    /// Runs on a thread-pool thread. Serialised by _decoderRunning so H264Decoder
+    /// is always called from a single thread at a time (its documented requirement).
+    private void DrainVideoFrames()
+    {
+        while (true)
+        {
+            var frame = _latestVideoFrame;
+            _latestVideoFrame = null;
+            if (frame == null) break;
+            _decoder?.Feed(frame);
+        }
+        System.Threading.Interlocked.Exchange(ref _decoderRunning, 0);
+        // Lost-wakeup guard: a new frame may have arrived between the while-exit
+        // and the flag release. Schedule a new drain task rather than recursing.
+        if (_latestVideoFrame != null &&
+            System.Threading.Interlocked.CompareExchange(ref _decoderRunning, 1, 0) == 0)
+            System.Threading.Tasks.Task.Run(DrainVideoFrames);
     }
 
     private void OnCamerasReceived(object? sender, AvailableCameras msg)
@@ -246,11 +289,19 @@ public partial class MainWindow : Window
         });
     }
 
+    private void OnLatencyUpdated(object? sender, int ms)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            txtLatency.Text = $"~{ms} ms";
+            txtInfoSep.Visibility = txtInfo.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        });
+    }
+
     // ── Decoder output (background thread) ────────────────────────────────────
 
     private void OnFrameDecoded(object? sender, DecodedFrame frame)
     {
-        // Drop frame if the UI thread already has one queued — keeps latency minimal.
         if (System.Threading.Interlocked.CompareExchange(ref _pendingFrame, 1, 0) != 0)
             return;
 
@@ -260,19 +311,19 @@ public partial class MainWindow : Window
 
             if (frame.Width <= 1) return;
 
-            pnlNoStream.Visibility = Visibility.Collapsed;
+            pnlNoStream.Visibility  = Visibility.Collapsed;
+            pnlVideoInfo.Visibility = Visibility.Visible;
 
             if (_bitmap is null || _frameWidth != frame.Width || _frameHeight != frame.Height)
             {
-                _frameWidth = frame.Width;
+                _frameWidth  = frame.Width;
                 _frameHeight = frame.Height;
                 _bitmap = new WriteableBitmap(
-                    frame.Width, frame.Height,
-                    96, 96,
-                    PixelFormats.Bgra32,
-                    null);
+                    frame.Width, frame.Height, 96, 96,
+                    PixelFormats.Bgra32, null);
                 imgPreview.Source = _bitmap;
                 txtInfo.Text = $"{frame.Width}×{frame.Height}";
+                txtInfoSep.Visibility = txtLatency.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
             }
 
             _bitmap.Lock();
@@ -300,8 +351,7 @@ public partial class MainWindow : Window
 
     private void OnQualityChanged(object sender, RoutedEventArgs e)
     {
-        // Only reconfigure when already connected
-        if (_cm?.State == TransportState.Connected || _cm?.State == (TransportState)4 /* streaming */)
+        if (_cm?.State == TransportState.Connected || _cm?.State == (TransportState)4)
             _ = SendConfigureAndStartAsync();
     }
 
@@ -309,13 +359,6 @@ public partial class MainWindow : Window
     {
         _rotation = (_rotation + 90) % 360;
         imgRotation.Angle = _rotation;
-    }
-
-    private async void OnStopClicked(object sender, RoutedEventArgs e)
-    {
-        if (_cm is null) return;
-        await _cm.StopStreamAsync();
-        btnStop.IsEnabled = false;
     }
 
     private void OnMuteClicked(object sender, RoutedEventArgs e)
@@ -329,10 +372,17 @@ public partial class MainWindow : Window
     private async Task SendConfigureAndStartAsync()
     {
         if (_cm is null) return;
-        bool is4K = rb4K.IsChecked == true;
-        string res = is4K ? "3840x2160" : "1920x1080";
-        int rate = is4K ? 25_000_000 : 8_000_000;
-        await _cm.ConfigureAsync(res, 30, "h264", rate);
+
+        var (res, fps, bitrate) = true switch
+        {
+            _ when rb720p60.IsChecked  == true => ("1280x720",  60,  7_000_000),
+            _ when rb1080p60.IsChecked == true => ("1920x1080", 60, 16_000_000),
+            _ when rb4K.IsChecked      == true => ("3840x2160", 30, 25_000_000),
+            _ when rb4K60.IsChecked    == true => ("3840x2160", 60, 50_000_000),
+            _                                   => ("1920x1080", 30,  8_000_000),
+        };
+
+        await _cm.ConfigureAsync(res, fps, "h264", bitrate);
     }
 
     private static string GetLocalIpHint()
@@ -354,14 +404,14 @@ public partial class MainWindow : Window
 
     private void UpdateStatus(TransportState state, TransportType type)
     {
-        (ellStatus.Fill, txtStatus.Text) = state switch
+        (ellStatus.Fill, txtStatus.Text, txtStatus.Foreground) = state switch
         {
-            TransportState.Idle => (Brushes.Gray, "Idle"),
-            TransportState.Listening => (Brushes.DodgerBlue, "Searching…"),
-            TransportState.Connected => (Brushes.LimeGreen, "Connected"),
-            TransportState.Disconnected => (Brushes.Orange, "Disconnected"),
-            TransportState.Error => (Brushes.OrangeRed, "Error"),
-            _ => (Brushes.Gray, state.ToString()),
+            TransportState.Idle         => (new SolidColorBrush(Color.FromRgb(0x48,0x48,0x4A)), "Idle",          new SolidColorBrush(Color.FromRgb(0x63,0x63,0x66))),
+            TransportState.Listening    => (new SolidColorBrush(Color.FromRgb(0x0A,0x84,0xFF)), "Searching…",    new SolidColorBrush(Color.FromRgb(0x0A,0x84,0xFF))),
+            TransportState.Connected    => (new SolidColorBrush(Color.FromRgb(0x30,0xD1,0x58)), "Connected",     new SolidColorBrush(Color.FromRgb(0x30,0xD1,0x58))),
+            TransportState.Disconnected => (new SolidColorBrush(Color.FromRgb(0xFF,0x9F,0x0A)), "Disconnected",  new SolidColorBrush(Color.FromRgb(0xFF,0x9F,0x0A))),
+            TransportState.Error        => (new SolidColorBrush(Color.FromRgb(0xFF,0x45,0x3A)), "Error",         new SolidColorBrush(Color.FromRgb(0xFF,0x45,0x3A))),
+            _                           => (new SolidColorBrush(Color.FromRgb(0x48,0x48,0x4A)), state.ToString(), new SolidColorBrush(Color.FromRgb(0x63,0x63,0x66))),
         };
 
         if (type == TransportType.None)

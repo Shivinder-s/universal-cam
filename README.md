@@ -2,7 +2,7 @@
 
 Use your iPhone as a camera and microphone source for a Windows app over Wi-Fi (QUIC) or USB tunnel (TCP).
 
-> Status: Active prototype (Phase 1).
+> Status: Active prototype (Phase 1–2).
 
 ---
 
@@ -11,9 +11,10 @@ Use your iPhone as a camera and microphone source for a Windows app over Wi-Fi (
 This repository contains both sides of the system:
 
 - iOS app (SwiftUI): camera/audio capture, H.264 + AAC encoding, Bonjour discovery, QUIC/TCP transport.
-- Windows app (WPF): stream session orchestration, transport listeners, protocol parsing, preview UI.
+- Windows app (WPF): stream session orchestration, transport listeners, protocol parsing, preview UI, virtual camera output.
 
-Core transport/protocol implementation currently lives in `src/UniversalCam.Core`.
+Core transport/protocol implementation lives in `src/UniversalCam.Core`.
+Virtual camera output lives in `src/UniversalCam.VirtualCamera`.
 
 ---
 
@@ -23,24 +24,30 @@ Core transport/protocol implementation currently lives in `src/UniversalCam.Core
 - Wi-Fi transport via QUIC on port `7779`.
 - USB path via localhost TCP tunnel on port `7780`.
 - Unified control protocol (JSON control messages + stream-type multiplexing).
+- PC→iOS bidirectional messaging over the iPhone-opened QUIC stream.
+- H.264 Annex B decode on Windows via FFmpeg (libavcodec software decoder).
+- SAR-corrected YUV→BGRA32 conversion via `sws_scale` (BT.709).
+- Virtual camera output via Windows 11 MF `IMFVirtualCamera` (no driver signing required).
 - Video and audio frame parsing on Windows.
 - Basic Windows preview window with connection state and transport badge.
 - Camera/microphone permission flow and settings entry points on iOS.
+- Camera controls: switch between 1080p and 4K stream configuration from the Windows UI.
+- iOS keeps screen awake while streaming.
+- Single-instance enforcement on Windows to avoid duplicate listeners.
 
 ### Latest Updates (March 2026)
 
-- Windows app now enforces a single running instance to avoid duplicate listeners.
-- Main preview UI was refreshed with branded assets (app icon + wordmark), improved status/latency presentation, and camera list interactions.
-- Camera controls now support switching between 1080p and 4K stream configuration from the Windows UI.
-- Transport activation on Windows now waits for the iPhone Hello handshake before choosing the active path, improving QUIC/USB fallback behavior.
-- iOS client now keeps the screen awake while streaming and restores normal sleep behavior when streaming stops.
-- iOS camera session resolution now updates to match incoming configure requests (1080p or 4K).
+- QUIC PC→iOS messaging now uses the iPhone-opened bidirectional stream (fixes handshake on iOS where server-initiated streams are unavailable).
+- H.264 decode upgraded from placeholder to full FFmpeg software pipeline with keyframe gating and BT.709-correct color conversion.
+- Virtual camera project added: `IMFVirtualCamera` (Windows 11 22H2+) with DirectShow fallback for older Windows.
+- Audio output pipeline wired up via NAudio WASAPI.
+- iOS `Hello` is now sent on `.ready`, completing the QUIC handshake without a server-initiated stream.
 
 ---
 
 ## Known Prototype Limitations
 
-- Windows `H264Decoder` is currently a Phase 1 stub and emits placeholder frames.
+- MF virtual camera (`IMFVirtualCamera`) requires Windows 11 22H2 or newer and COM registration — currently fails with `E_NOINTERFACE` in some environments.
 - Audio playback/rendering pipeline on Windows is not complete yet.
 - USB requires a local forwarding setup and Apple mobile device support on Windows.
 - Protocol and app UX are still evolving.
@@ -52,6 +59,7 @@ Core transport/protocol implementation currently lives in `src/UniversalCam.Core
 ### Windows
 
 - Windows 10 version 2004 (build `19041`) or newer
+- Windows 11 22H2+ for virtual camera output (`IMFVirtualCamera`)
 - .NET 8 SDK
 - Visual Studio 2022 Build Tools (Desktop .NET workloads)
 
@@ -100,7 +108,11 @@ universal-cam/
       Discovery/               # Bonjour advertisement
       Protocol/                # Control messages + frame header model
       Transport/               # QUIC server, TCP USB transport, parser
-      Video/                   # H.264 decode pipeline (stub in Phase 1)
+      Video/                   # H.264 decode pipeline (FFmpeg/libavcodec)
+    UniversalCam.VirtualCamera/ # Virtual camera output
+      MfVirtualCameraServer    # IMFVirtualCamera (Windows 11 22H2+)
+      DsVirtualCameraServer    # DirectShow fallback (older Windows)
+      SharedMemoryBridge       # Frame handoff between app and camera server
   ios/
     UniversalCamPhone/         # iOS app (capture, encode, transport, UI)
   tests/
@@ -134,6 +146,9 @@ See `ios/UniversalCamPhone/Transport/PROTOCOL.md` for full details.
 | Windows UI | WPF (.NET 8, x64) |
 | Windows transport | `System.Net.Quic`, `TcpClient` |
 | Windows discovery | `Makaretu.Dns.Multicast` |
+| Windows video decode | FFmpeg via `Sdcb.FFmpeg` (libavcodec H.264 software) |
+| Windows virtual camera | MF `IMFVirtualCamera` / DirectShow |
+| Windows audio output | NAudio WASAPI |
 | iOS UI | SwiftUI |
 | iOS media | AVFoundation, VideoToolbox |
 | iOS networking | Network.framework (`NWConnection`, `NWListener`, `NWBrowser`) |

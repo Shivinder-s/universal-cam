@@ -33,6 +33,9 @@ public sealed class QuicServer : ITransport
     private QuicStream?     _responseStream; // the bidirectional stream iOS opened; we write back on it
     private readonly FrameParser _parser = new();
     private CancellationTokenSource? _cts;
+    // Serialize writes: QuicStream doesn't allow concurrent WriteAsync/FlushAsync calls.
+    // Configure (UI thread) and StartStream (QUIC receive thread) can overlap otherwise.
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     public QuicServer()
     {
@@ -79,20 +82,31 @@ public sealed class QuicServer : ITransport
 
     public async Task SendControlAsync(ControlMessage message, CancellationToken ct = default)
     {
+        // Fast pre-check (no lock): skip if obviously no stream.
         if (_responseStream is null) return;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            // Re-check INSIDE the lock — AcceptLoopAsync also holds _writeLock when it
+            // disposes _responseStream, so this check is race-free.
+            var stream = _responseStream;
+            if (stream is null) return;
+
             var json = message.ToJsonBytes();
             var packet = new byte[json.Length + 2];
             packet[0] = FrameHeader.StreamTypeControl;
             json.CopyTo(packet, 1);
             packet[^1] = 0x0A;
-            await _responseStream.WriteAsync(packet, ct);
-            await _responseStream.FlushAsync(ct);
+            await stream.WriteAsync(packet, ct).ConfigureAwait(false);
+            await stream.FlushAsync(ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[QuicServer] Send failed: {ex.Message}");
+        }
+        finally
+        {
+            _writeLock.Release();
         }
     }
 
@@ -107,9 +121,23 @@ public sealed class QuicServer : ITransport
                 var connection = await _listener.AcceptConnectionAsync(ct);
                 Console.WriteLine($"[QuicServer] iPhone connected: {connection.RemoteEndPoint}");
 
-                // Only one connection at a time
-                _responseStream?.DisposeAsync().AsTask().Forget();
-                _responseStream = null;
+                // Hold _writeLock while swapping out _responseStream so SendControlAsync
+                // cannot capture then write to a stream we're about to dispose.
+                await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    if (_responseStream is not null)
+                    {
+                        try { await _responseStream.DisposeAsync(); } catch { }
+                        _responseStream = null;
+                    }
+                }
+                finally { _writeLock.Release(); }
+
+                // Fire-and-forget close: don't block accepting the new connection's streams.
+                // iOS sends Hello immediately on connect; if we awaited CloseAsync here,
+                // ReadStreamsAsync for the new connection wouldn't start until the old one
+                // finished closing, causing iOS to time out and reconnect in a loop.
                 _connection?.CloseAsync(0).AsTask().Forget();
                 _connection = connection;
 

@@ -120,7 +120,9 @@ final class ConnectionManager: ObservableObject {
             isEncoderPrepared = true
         }
 
-        sendControl(.startStream)
+        // Do NOT echo start_stream back — Windows drives the stream lifecycle.
+        // Sending start_stream here would open a new QUIC stream that's immediately
+        // closed, causing "stream accept: operation aborted" on Windows.
 
         // Start audio capture
         audioCapture.start()
@@ -405,10 +407,15 @@ final class ConnectionManager: ObservableObject {
             if components.count == 2,
                let width = Int32(components[0]),
                let height = Int32(components[1]) {
-                // Update capture session preset to match requested resolution
-                let preset: AVCaptureSession.Preset = (width >= 3840) ? .hd4K3840x2160 : .hd1920x1080
-                cameraSession?.setResolution(preset)
-
+                let preset: AVCaptureSession.Preset
+                if width >= 3840 {
+                    preset = .hd4K3840x2160
+                } else if width <= 1280 {
+                    preset = .hd1280x720
+                } else {
+                    preset = .hd1920x1080
+                }
+                cameraSession?.setResolutionAndFPS(preset: preset, fps: Int32(fps))
                 encoder.prepare(width: width, height: height, fps: Int32(fps), bitrate: bitrate)
                 isEncoderPrepared = true
             }

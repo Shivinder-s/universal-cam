@@ -56,7 +56,7 @@ final class CameraSession: NSObject, ObservableObject {
             position: .unspecified
         )
 
-        let cameras = discovery.devices.map { device in
+        let allCameras = discovery.devices.map { device in
             CameraInfo(
                 id: device.uniqueID,
                 name: device.localizedName,
@@ -64,6 +64,13 @@ final class CameraSession: NSObject, ObservableObject {
                 type: deviceTypeString(device.deviceType),
                 zoomFactor: opticalZoomFactor(for: device)
             )
+        }
+
+        // On devices with a TrueDepth camera, the front wide-angle camera is the same
+        // physical sensor exposed under two device types — deduplicate by preferring true_depth.
+        let hasFrontTrueDepth = allCameras.contains { $0.position == "front" && $0.type == "true_depth" }
+        let cameras = allCameras.filter { cam in
+            !(hasFrontTrueDepth && cam.position == "front" && cam.type == "wide_angle")
         }
 
         DispatchQueue.main.async {
@@ -162,6 +169,60 @@ final class CameraSession: NSObject, ObservableObject {
             }
             self.captureSession.commitConfiguration()
             self.applyLandscapeRotation()   // re-lock after preset change
+        }
+    }
+
+    func setResolutionAndFPS(preset: AVCaptureSession.Preset, fps: Int32) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            // Apply session preset for the target resolution
+            self.captureSession.beginConfiguration()
+            if self.captureSession.canSetSessionPreset(preset) {
+                self.captureSession.sessionPreset = preset
+            }
+            self.captureSession.commitConfiguration()
+            self.applyLandscapeRotation()
+
+            guard let device = self.currentVideoDevice() else { return }
+            let targetFPS = Double(fps)
+
+            // If the current active format doesn't support the requested fps (common for
+            // 4K 60fps where the preset defaults to a 30fps format), find one that does.
+            let currentSupports = device.activeFormat.videoSupportedFrameRateRanges
+                .contains { $0.maxFrameRate >= targetFPS }
+
+            if !currentSupports {
+                let currentDims = CMVideoFormatDescriptionGetDimensions(
+                    device.activeFormat.formatDescription)
+                if let format = device.formats.first(where: { fmt in
+                    let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+                    return d.width >= currentDims.width
+                        && d.height >= currentDims.height
+                        && fmt.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= targetFPS }
+                }) {
+                    do {
+                        try device.lockForConfiguration()
+                        device.activeFormat = format
+                        device.unlockForConfiguration()
+                    } catch {
+                        print("[CameraSession] Failed to set high-fps format: \(error)")
+                    }
+                } else {
+                    print("[CameraSession] No format found for \(fps) fps at current resolution — using max available")
+                }
+            }
+
+            // Set the frame duration (clamped silently by the driver if out of range)
+            let duration = CMTimeMake(value: 1, timescale: fps)
+            do {
+                try device.lockForConfiguration()
+                device.activeVideoMinFrameDuration = duration
+                device.activeVideoMaxFrameDuration = duration
+                device.unlockForConfiguration()
+            } catch {
+                print("[CameraSession] Failed to set fps \(fps): \(error)")
+            }
         }
     }
 

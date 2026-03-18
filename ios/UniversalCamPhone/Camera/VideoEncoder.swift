@@ -73,7 +73,19 @@ final class VideoEncoder {
     // MARK: - Private (must run on encoderQueue)
 
     private func encodeOnQueue(_ sampleBuffer: CMSampleBuffer) {
-        guard let session, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // Adapt to the actual pixel buffer dimensions. The front camera may deliver
+        // portrait-oriented buffers (e.g. 1080×1920) even when the session preset
+        // is hd1920x1080, because videoRotationAngle is metadata-only on some configs.
+        // Feeding mismatched buffers to a landscape VTCompressionSession squishes the image.
+        let bufW = Int32(CVPixelBufferGetWidth(pixelBuffer))
+        let bufH = Int32(CVPixelBufferGetHeight(pixelBuffer))
+        if session == nil || bufW != lastWidth || bufH != lastHeight {
+            createSession(width: bufW, height: bufH, fps: lastFPS, bitrate: lastBitrate)
+        }
+
+        guard let session else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let dur = CMSampleBufferGetDuration(sampleBuffer)
 
@@ -112,6 +124,7 @@ final class VideoEncoder {
         lastHeight = height
         lastFPS = fps
         lastBitrate = bitrate
+        frameCount = 0  // always start new session with a forced keyframe
 
         var s: VTCompressionSession?
         let status = VTCompressionSessionCreate(

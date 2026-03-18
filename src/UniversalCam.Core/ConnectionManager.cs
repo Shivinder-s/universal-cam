@@ -33,6 +33,12 @@ public sealed class ConnectionManager : IAsyncDisposable
     /// Fires when the iPhone sends its camera list.
     public event EventHandler<AvailableCameras>? CamerasReceived;
 
+    /// Fires when the iPhone acknowledges a camera switch. Subscribers should flush decoder state.
+    public event EventHandler? CameraSwitched;
+
+    /// Fires with one-way latency (ms) after each Pong response.
+    public event EventHandler<int>? LatencyUpdated;
+
     // ── State ────────────────────────────────────────────────────────────────
 
     public TransportState State { get; private set; } = TransportState.Idle;
@@ -141,8 +147,12 @@ public sealed class ConnectionManager : IAsyncDisposable
 
         switch (state)
         {
-            // Don't claim active on Connected — wait for Hello handshake instead.
-            // This prevents a fast-failing QUIC connection from blocking USB.
+            // USB uses Welcome→Hello: send Welcome so iOS responds with Hello.
+            // WiFi (QUIC) sends Hello proactively when ready, so no Welcome needed there.
+            case TransportState.Connected:
+                if (type == TransportType.USB)
+                    _ = transport.SendControlAsync(new Welcome());
+                break;
 
             case TransportState.Disconnected:
             case TransportState.Error:
@@ -168,8 +178,11 @@ public sealed class ConnectionManager : IAsyncDisposable
                 DeviceName = hello.DeviceName;
 
                 // USB always wins over WiFi; WiFi only wins if nothing connected yet.
+                // Same-transport reconnects (e.g., iOS closed and re-opened the QUIC connection)
+                // are always promoted so Windows re-sends Configure and streaming resumes.
                 bool shouldPromote = _active is null
-                    || (ActiveTransport == TransportType.WiFi && type == TransportType.USB);
+                    || (ActiveTransport == TransportType.WiFi && type == TransportType.USB)
+                    || ActiveTransport == type;
                 if (shouldPromote)
                 {
                     _active         = transport;
@@ -184,12 +197,17 @@ public sealed class ConnectionManager : IAsyncDisposable
                 _ = transport.SendControlAsync(new StartStream());
                 break;
 
+            case SwitchCameraAck:
+                CameraSwitched?.Invoke(this, EventArgs.Empty);
+                break;
+
             case AvailableCameras cameras:
                 CamerasReceived?.Invoke(this, cameras);
                 break;
 
             case Pong pong:
-                // RTT = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - pong.Ts (available if needed)
+                var rtt = (int)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - pong.Ts);
+                LatencyUpdated?.Invoke(this, rtt / 2);
                 break;
 
             case Ping ping:

@@ -105,6 +105,10 @@ public sealed class VirtualCameraSession : IDisposable
         if (!_isEnabled || _server == null)
             return;
 
+        // Virtual camera only handles landscape frames; portrait trips up the COM pipeline
+        if (frame.Height > frame.Width)
+            return;
+
         // Check if resolution changed
         if (frame.Width != _currentWidth || frame.Height != _currentHeight)
         {
@@ -112,9 +116,16 @@ public sealed class VirtualCameraSession : IDisposable
             _currentHeight = frame.Height;
             Console.WriteLine($"[VirtualCamera] Resolution changed to {_currentWidth}×{_currentHeight}");
 
-            // Notify servers of media type change
-            (_server as MfVirtualCameraServer)?.UpdateMediaType(_currentWidth, _currentHeight, 30);
-            (_server as DsVirtualCameraServer)?.UpdateMediaType(_currentWidth, _currentHeight, 30);
+            // Notify servers of media type change (guard: COM can reject unusual resolutions)
+            try
+            {
+                (_server as MfVirtualCameraServer)?.UpdateMediaType(_currentWidth, _currentHeight, 30);
+                (_server as DsVirtualCameraServer)?.UpdateMediaType(_currentWidth, _currentHeight, 30);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[VirtualCamera] UpdateMediaType failed for {_currentWidth}×{_currentHeight}: {ex.Message}");
+            }
         }
 
         // Convert BGRA32 to NV12 and enqueue

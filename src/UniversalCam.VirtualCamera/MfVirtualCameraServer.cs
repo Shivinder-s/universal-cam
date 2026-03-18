@@ -52,6 +52,14 @@ internal sealed class MfVirtualCameraServer : IVirtualCameraServer
         {
             Console.WriteLine($"[MfVirtualCameraServer] Initialization failed: {ex.Message}");
             _isRunning = false;
+            // Shut down + clean up any partially-created MF objects so their COM threads
+            // don't fire callbacks into this half-initialized instance and crash the CLR.
+            // Shutdown() cancels pending BeginGetEvent callbacks before Dispose releases the COM refs.
+            try { ((IMFMediaSource?)_mediaSourceWrapper)?.Shutdown(); } catch { }
+            try { _mediaSourceWrapper?.Dispose(); } catch { }
+            _mediaSourceWrapper = null;
+            if (_mfStartupCalled) { try { NativeMF.MFShutdown(); } catch { } _mfStartupCalled = false; }
+            throw; // let VirtualCameraSession catch this so _server stays null
         }
     }
 
