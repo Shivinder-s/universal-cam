@@ -88,6 +88,7 @@ public sealed class QuicServer : ITransport
             json.CopyTo(packet, 1);
             packet[^1] = 0x0A;
             await _controlStream.WriteAsync(packet, ct);
+            await _controlStream.FlushAsync(ct);
         }
         catch (Exception ex)
         {

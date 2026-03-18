@@ -230,7 +230,20 @@ final class ConnectionManager: ObservableObject {
     private func handleWifiTransportStateChange(_ transportState: NWConnection.State) {
         switch transportState {
         case .ready:
-            break // Wait for welcome message
+            // Don't wait for a server-initiated Welcome stream (requires newConnectionHandler,
+            // which is unreliable across iOS versions). Send Hello immediately so Windows
+            // can drive the handshake (Configure → ConfigureAck → StartStream).
+            // USB still uses the Welcome → Hello path and will override if it connects later.
+            guard activeTransport == nil else { break } // USB already active — don't override
+            activeTransport = .wifi
+            let hello = ControlMessage.hello(
+                deviceName: UIDevice.current.name,
+                capabilities: ["h264", "aac_lc", "stereo_audio"]
+            )
+            wifiTransport.sendControl(hello)
+            DispatchQueue.main.async { self.state = .connected }
+            print("[ConnectionManager] QUIC ready — sent Hello proactively")
+            sendAvailableCameras()
         case .failed(let error):
             if activeTransport == .wifi {
                 state = .error("WiFi connection failed: \(error.localizedDescription)")
