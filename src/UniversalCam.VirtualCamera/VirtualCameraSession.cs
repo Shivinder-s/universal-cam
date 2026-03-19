@@ -62,15 +62,10 @@ public sealed class VirtualCameraSession : IDisposable
         var osVersion = Environment.OSVersion.Version;
         if (osVersion.Build >= 22621)
         {
-            // Windows 11 22H2+: Use MF Virtual Camera
-            try
-            {
-                _server = new MfVirtualCameraServer(_frameBuffer);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[VirtualCamera] Failed to initialize MF server: {ex.Message}");
-            }
+            // MF Virtual Camera temporarily disabled — IMFPresentationDescriptor GUID mismatch
+            // causes init to fail and leaves native COM event queue in unknown state.
+            // TODO: fix GUID and re-enable.
+            Console.WriteLine("[VirtualCamera] MF server skipped (GUID fix pending)");
         }
         else if (osVersion.Build >= 19041)
         {

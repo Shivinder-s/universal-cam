@@ -35,9 +35,21 @@ internal sealed class MfMediaSourceWrapper : IMFMediaSource, IDisposable
         if (!NativeMF.Succeeded(hr))
             throw new COMException("[MfMediaSourceWrapper] MFCreateEventQueue failed", hr);
 
-        // Build initial stream descriptor and media stream
-        BuildStreamDescriptor(_width, _height, _fps);
-        _mediaStream = new MfMediaStream(0, this, _streamDescriptor!);
+        try
+        {
+            // Build initial stream descriptor and media stream
+            BuildStreamDescriptor(_width, _height, _fps);
+            _mediaStream = new MfMediaStream(0, this, _streamDescriptor!);
+        }
+        catch
+        {
+            // Shut down and release the event queue before propagating so MF's native
+            // async threads can't call back into this partially-constructed object → 0x80131506.
+            try { _eventQueue?.Shutdown(); } catch { }
+            try { _eventQueue?.Dispose(); }  catch { }
+            _eventQueue = null;
+            throw;
+        }
     }
 
     // ── Public helpers called by MfVirtualCameraServer ────────────────────

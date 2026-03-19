@@ -1,9 +1,11 @@
+using System.Collections.Generic;
 using System.Globalization;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Data;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -87,25 +89,46 @@ public partial class MainWindow : Window
     // ── Render-level drop guard: skip Dispatcher if a frame is already queued ──
     private int _pendingFrame;
 
-    // ── Decode-level drop guard: always decode only the newest received frame ──
-    private volatile MediaFrame? _latestVideoFrame;
+    // ── Decode queue: all frames enqueued in order so H.264 P-frame chain is intact ──
+    private readonly System.Collections.Concurrent.ConcurrentQueue<MediaFrame> _videoQueue = new();
+    private const int MaxVideoQueueDepth = 32;
     private int _decoderRunning;
+
+    // ── iPhone audio toggle ────────────────────────────────────────────────────
+    private bool _phoneAudioEnabled = true;
 
     private string _currentCameraId = string.Empty;
 
-    // Debounce Configure sends: WiFi+USB hellos arrive within ~50 ms of each other,
-    // causing two Connected events and two Configure messages. Cancel the first and
-    // let the second win so we send exactly one Configure on the active transport.
     private CancellationTokenSource? _configCts;
 
-    private readonly DispatcherTimer _vuTimer = new() { Interval = TimeSpan.FromMilliseconds(80) };
-    private readonly DispatcherTimer _pingTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly DispatcherTimer _vuTimer    = new() { Interval = TimeSpan.FromMilliseconds(80) };
+    private readonly DispatcherTimer _pingTimer  = new() { Interval = TimeSpan.FromSeconds(1) };
+
+    // Fix 5C: frame-alive pulse on status dot
+    private readonly DispatcherTimer _framePulseTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+    private long _lastFrameReceivedTick;
+    private bool _pulseState;
+
+    // Fix 5A: FPS tracking (UI-thread-only fields)
+    private int  _fpsCount;
+    private long _lastFpsTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    private int  _lastFps;
+
+    // Fix 3: zoom level
+    private double _framingZoom = 1.0;
+
+    // Portrait framing: crop position (0.0 = top, 1.0 = bottom, 0.5 = centre)
+    private double _portraitCropNorm = 0.5;
+    private bool   _isPortrait;
+
+    private bool _reallyClosing;
 
     public MainWindow()
     {
         InitializeComponent();
-        Loaded += OnLoaded;
-        Closed += OnClosed;
+        Loaded  += OnLoaded;
+        Closing += OnClosing;
+        Closed  += OnClosed;
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -121,6 +144,11 @@ public partial class MainWindow : Window
         _audioPlayer = new AudioPlayer();
         _aacDecoder.PcmDecoded += (_, pcm) => _audioPlayer.Feed(pcm);
 
+        cbAudioDevice.ItemsSource       = AudioPlayer.GetOutputDevices();
+        cbAudioDevice.DisplayMemberPath = "Name";
+        if (cbAudioDevice.Items.Count > 0)
+            cbAudioDevice.SelectedIndex = 0;
+
         _vuTimer.Tick += (_, _) =>
         {
             if (_audioPlayer is not null && pbVolume.IsEnabled)
@@ -130,12 +158,23 @@ public partial class MainWindow : Window
 
         _pingTimer.Tick += (_, _) => _ = _cm?.PingAsync();
 
+        // Fix 5C: pulse the connection dot when frames are arriving
+        _framePulseTimer.Tick += (_, _) =>
+        {
+            bool alive = _cm?.State == TransportState.Connected &&
+                         Environment.TickCount64 - System.Threading.Volatile.Read(ref _lastFrameReceivedTick) < 500;
+            if (alive) { _pulseState = !_pulseState; ellStatus.Opacity = _pulseState ? 1.0 : 0.45; }
+            else ellStatus.Opacity = 1.0;
+        };
+        _framePulseTimer.Start();
+
         _cm = new ConnectionManager();
         _cm.StateChanged    += OnStateChanged;
         _cm.FrameReceived   += OnMediaFrame;
         _cm.CamerasReceived += OnCamerasReceived;
         _cm.LatencyUpdated  += OnLatencyUpdated;
-        _cm.CameraSwitched  += (_, _) => _decoder?.Reset();
+        _cm.CameraSwitched      += (_, _) => _decoder?.RequestReset();
+        _cm.OrientationChanged  += OnOrientationChanged;
 
         _decoder.FrameDecoded += _vCamSession.OnFrameDecoded;
         _cm.StateChanged      += _vCamSession.OnConnectionStateChanged;
@@ -147,16 +186,27 @@ public partial class MainWindow : Window
         catch (Exception ex) { txtWaiting.Text = $"Startup error: {ex.Message}"; }
     }
 
+    private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_reallyClosing) return;
+        e.Cancel = true;
+        Hide();
+    }
+
+    internal void ForceClose()
+    {
+        _reallyClosing = true;
+        Close();
+    }
+
     private async void OnClosed(object? sender, EventArgs e)
     {
         _pingTimer.Stop();
         _vuTimer.Stop();
+        _framePulseTimer.Stop();
         _configCts?.Cancel();
 
-        // Stop feeding new frames and wait for any in-flight drain task to exit
-        // before disposing the FFmpeg codec context — without this, avcodec_receive_frame
-        // can be called on a freed AVCodecContext → AccessViolationException.
-        _latestVideoFrame = null;
+        while (_videoQueue.TryDequeue(out _)) { }
         while (System.Threading.Interlocked.CompareExchange(ref _decoderRunning, 0, 0) != 0)
             await Task.Delay(5);
 
@@ -226,44 +276,37 @@ public partial class MainWindow : Window
     {
         if (frame.IsVideo)
         {
-            // Overwrite with newest frame — the decode task will pick it up.
-            // Older frames that haven't been decoded yet are silently replaced,
-            // ensuring we always decode the freshest data even during bursts.
-            _latestVideoFrame = frame;
+            _videoQueue.Enqueue(frame);
+            while (_videoQueue.Count > MaxVideoQueueDepth)
+                _videoQueue.TryDequeue(out _);
             if (System.Threading.Interlocked.CompareExchange(ref _decoderRunning, 1, 0) == 0)
                 System.Threading.Tasks.Task.Run(DrainVideoFrames);
         }
-        else if (frame.IsAudio)
+        else if (frame.IsAudio && _phoneAudioEnabled)
         {
-            _aacDecoder?.Decode(frame.Payload, frame.Header.PtsUs);
+            try { _aacDecoder?.Decode(frame.Payload, frame.Header.PtsUs); }
+            catch (Exception ex) { Console.WriteLine($"[MainWindow] Audio decode error: {ex.GetType().Name}: {ex.Message}"); }
         }
     }
 
-    /// Runs on a thread-pool thread. Serialised by _decoderRunning so H264Decoder
-    /// is always called from a single thread at a time (its documented requirement).
     private void DrainVideoFrames()
     {
-        while (true)
+        while (_videoQueue.TryDequeue(out var frame))
         {
-            var frame = _latestVideoFrame;
-            _latestVideoFrame = null;
-            if (frame == null) break;
-            _decoder?.Feed(frame);
+            try { _decoder?.Feed(frame); }
+            catch (Exception ex) { Console.WriteLine($"[MainWindow] Decode error: {ex.GetType().Name}: {ex.Message}"); }
         }
         System.Threading.Interlocked.Exchange(ref _decoderRunning, 0);
-        // Lost-wakeup guard: a new frame may have arrived between the while-exit
-        // and the flag release. Schedule a new drain task rather than recursing.
-        if (_latestVideoFrame != null &&
+        if (!_videoQueue.IsEmpty &&
             System.Threading.Interlocked.CompareExchange(ref _decoderRunning, 1, 0) == 0)
             System.Threading.Tasks.Task.Run(DrainVideoFrames);
     }
 
+    // Fix 1: auto-select first back camera when server sends no current camera ID
     private void OnCamerasReceived(object? sender, AvailableCameras msg)
     {
         Dispatcher.BeginInvoke(() =>
         {
-            _currentCameraId = msg.CurrentCameraId;
-
             var vms = msg.Cameras
                 .Select(c => new CameraViewModel
                 {
@@ -276,6 +319,17 @@ public partial class MainWindow : Window
                 })
                 .ToList();
 
+            // Fix 1: if nothing is selected, highlight the first back camera visually
+            if (!vms.Any(v => v.IsSelected))
+            {
+                var first = vms.FirstOrDefault(v => v.Position == "back") ?? vms.FirstOrDefault();
+                if (first is not null) { first.IsSelected = true; _currentCameraId = first.Id; }
+            }
+            else
+            {
+                _currentCameraId = msg.CurrentCameraId;
+            }
+
             var back  = vms.Where(c => c.Position == "back").ToList();
             var front = vms.Where(c => c.Position is "front" or "unspecified").ToList();
 
@@ -286,6 +340,22 @@ public partial class MainWindow : Window
 
             if (_cm is not null && _cm.DeviceName is { Length: > 0 } name)
                 txtDeviceName.Text = name;
+        });
+    }
+
+    private void OnOrientationChanged(object? sender, string orientation)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            bool portrait = orientation == "portrait";
+            if (portrait == _isPortrait) return;
+            _isPortrait = portrait;
+            pnlPortraitFraming.Visibility = portrait ? Visibility.Visible : Visibility.Collapsed;
+            if (!portrait)
+            {
+                _portraitCropNorm      = 0.5;
+                sldrPortraitCrop.Value = 0.5;
+            }
         });
     }
 
@@ -302,51 +372,101 @@ public partial class MainWindow : Window
 
     private void OnFrameDecoded(object? sender, DecodedFrame frame)
     {
+        // Fix 5C: record timestamp so the pulse timer knows frames are alive
+        System.Threading.Volatile.Write(ref _lastFrameReceivedTick, Environment.TickCount64);
+
         if (System.Threading.Interlocked.CompareExchange(ref _pendingFrame, 1, 0) != 0)
             return;
+
+        // Portrait crop: extract a landscape 16:9 slice at the user-chosen pan position.
+        // This runs on the decoder thread (before Dispatcher) to avoid blocking the UI.
+        int   dispW    = frame.Width;
+        int   dispH    = frame.Height;
+        byte[] dispData = frame.Data;
+        bool  portrait = frame.Height > frame.Width;
+
+        if (portrait)
+        {
+            int cropH  = (int)(frame.Width * 9.0 / 16.0);
+            cropH      = Math.Min(cropH, frame.Height);
+            int maxY   = frame.Height - cropH;
+            int cropY  = (int)(_portraitCropNorm * maxY);
+            cropY      = Math.Clamp(cropY, 0, maxY);
+
+            dispW    = frame.Width;
+            dispH    = cropH;
+            dispData = new byte[dispW * dispH * 4];
+            Buffer.BlockCopy(frame.Data, cropY * frame.Width * 4, dispData, 0, dispData.Length);
+        }
 
         Dispatcher.BeginInvoke(() =>
         {
             System.Threading.Interlocked.Exchange(ref _pendingFrame, 0);
 
-            if (frame.Width <= 1) return;
+            if (dispW <= 1) return;
+
+            // Show/hide the portrait framing panel
+            if (portrait != _isPortrait)
+            {
+                _isPortrait = portrait;
+                pnlPortraitFraming.Visibility = portrait ? Visibility.Visible : Visibility.Collapsed;
+            }
+            if (portrait) UpdatePortraitOverlay(frame.Height, dispH);
 
             pnlNoStream.Visibility  = Visibility.Collapsed;
             pnlVideoInfo.Visibility = Visibility.Visible;
 
-            if (_bitmap is null || _frameWidth != frame.Width || _frameHeight != frame.Height)
+            if (_bitmap is null || _frameWidth != dispW || _frameHeight != dispH)
             {
-                _frameWidth  = frame.Width;
-                _frameHeight = frame.Height;
+                _frameWidth  = dispW;
+                _frameHeight = dispH;
                 _bitmap = new WriteableBitmap(
-                    frame.Width, frame.Height, 96, 96,
+                    dispW, dispH, 96, 96,
                     PixelFormats.Bgra32, null);
                 imgPreview.Source = _bitmap;
-                txtInfo.Text = $"{frame.Width}×{frame.Height}";
-                txtInfoSep.Visibility = txtLatency.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
             }
 
             _bitmap.Lock();
             try
             {
-                Marshal.Copy(frame.Data, 0, _bitmap.BackBuffer, frame.Data.Length);
-                _bitmap.AddDirtyRect(new System.Windows.Int32Rect(0, 0, frame.Width, frame.Height));
+                Marshal.Copy(dispData, 0, _bitmap.BackBuffer, dispData.Length);
+                _bitmap.AddDirtyRect(new System.Windows.Int32Rect(0, 0, dispW, dispH));
             }
             finally
             {
                 _bitmap.Unlock();
             }
+
+            // Fix 5A: FPS counter — updated every second
+            _fpsCount++;
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (nowMs - _lastFpsTime >= 1000)
+            {
+                _lastFps     = (int)Math.Round(_fpsCount * 1000.0 / (nowMs - _lastFpsTime));
+                _fpsCount    = 0;
+                _lastFpsTime = nowMs;
+            }
+            txtInfo.Text = _lastFps > 0
+                ? $"{_frameWidth}×{_frameHeight}  {_lastFps} fps"
+                : $"{_frameWidth}×{_frameHeight}";
+            txtInfoSep.Visibility = txtLatency.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
         });
     }
 
     // ── Button / control handlers ─────────────────────────────────────────────
 
+    // Fix 2B: optimistic camera selection — highlight immediately, confirm via server
     private async void OnCameraRowClicked(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { Tag: string id } || _cm is null) return;
-        await _cm.SwitchCameraAsync(id);
-        await Task.Delay(300);
-        await _cm.ListCamerasAsync();
+        try
+        {
+            if (sender is not FrameworkElement { Tag: string id } || _cm is null) return;
+            UpdateCameraSelection(id);
+            await _cm.SwitchCameraAsync(id);
+            await Task.Delay(300);
+            await _cm.ListCamerasAsync();
+        }
+        catch (Exception ex) { Log(ex); }
     }
 
     private void OnQualityChanged(object sender, RoutedEventArgs e)
@@ -367,7 +487,116 @@ public partial class MainWindow : Window
         _audioPlayer.IsMuted = btnMute.IsChecked ?? false;
     }
 
+    private void OnPhoneAudioToggled(object sender, RoutedEventArgs e)
+    {
+        _phoneAudioEnabled = chkPhoneAudio.IsChecked ?? true;
+        if (_audioPlayer is null) return;
+        _audioPlayer.IsMuted = !_phoneAudioEnabled || (btnMute.IsChecked ?? false);
+    }
+
+    private void OnAudioDeviceChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (cbAudioDevice.SelectedItem is Audio.AudioDeviceInfo dev)
+            _audioPlayer?.SetDevice(dev.Id);
+    }
+
+    // Fix 3: framing / zoom handlers
+    private void ApplyZoom(double zoom)
+    {
+        _framingZoom      = zoom;
+        imgZoom.ScaleX    = zoom;
+        imgZoom.ScaleY    = zoom;
+        if (txtZoomLevel is not null) txtZoomLevel.Text = $"{zoom:0.0}×";
+        sldrZoom.Value    = zoom;
+    }
+
+    private void OnZoomChanged(object sender, System.Windows.RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (imgZoom is null || txtZoomLevel is null) return; // guard during InitializeComponent
+        try { ApplyZoom(Math.Round(e.NewValue, 2)); }
+        catch (Exception ex) { Log(ex); }
+    }
+
+    private void OnFrameFull(object sender, RoutedEventArgs e) { try { ApplyZoom(1.0);  } catch (Exception ex) { Log(ex); } }
+    private void OnFrame43  (object sender, RoutedEventArgs e) { try { ApplyZoom(1.33); } catch (Exception ex) { Log(ex); } }
+    private void OnFrame169 (object sender, RoutedEventArgs e) { try { ApplyZoom(1.0);  } catch (Exception ex) { Log(ex); } }
+
+    private void OnPortraitCropChanged(object sender, System.Windows.RoutedPropertyChangedEventArgs<double> e)
+    {
+        try { _portraitCropNorm = e.NewValue; }
+        catch (Exception ex) { Log(ex); }
+    }
+
+    /// <summary>
+    /// Moves the crop-window rectangle inside the portrait preview canvas.
+    /// srcH = original portrait height (e.g. 1920), cropH = landscape slice height (e.g. 607).
+    /// </summary>
+    private void UpdatePortraitOverlay(int srcH, int cropH)
+    {
+        const double canvasH = 72.0;
+        double winH   = canvasH * cropH / srcH;
+        double maxTop = canvasH - winH;
+        double top    = _portraitCropNorm * maxTop;
+
+        System.Windows.Controls.Canvas.SetTop(rctCropWindow, top);
+        rctCropWindow.Height = winH;
+
+        // Dim the areas outside the crop window
+        rctPortraitAbove.Height = top;
+        System.Windows.Controls.Canvas.SetTop(rctPortraitBelow, top + winH);
+        rctPortraitBelow.Height = canvasH - top - winH;
+    }
+
+    // Fix 5B: copy IP to clipboard
+    private void OnCopyIpClicked(object sender, RoutedEventArgs e)
+    {
+        var text = txtIpHint.Text;
+        if (string.IsNullOrWhiteSpace(text)) return;
+        Clipboard.SetText(text.StartsWith("PC: ") ? text[4..] : text);
+    }
+
+    // Fix 5D: keyboard shortcuts (M = mute, R = rotate)
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.Key == Key.M && btnMute.IsEnabled)
+        {
+            btnMute.IsChecked = !btnMute.IsChecked;
+            OnMuteClicked(btnMute, new RoutedEventArgs());
+        }
+        else if (e.Key == Key.R)
+        {
+            OnRotateClicked(btnRotate, new RoutedEventArgs());
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Logs an exception to Console — which TeeWriter forwards to logs/run_latest.txt.
+    /// Calling from event handlers prevents exceptions from bubbling to DispatcherUnhandledException,
+    /// so the VS Code debugger won't pause and the full trace is always in the log file.
+    /// </summary>
+    private static void Log(Exception ex,
+        [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
+        => Console.WriteLine($"[{caller}] {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+
+    // Fix 2B: immediately rebuild camera ItemsSources with new selection (no INPC on CameraViewModel)
+    private void UpdateCameraSelection(string id)
+    {
+        _currentCameraId = id;
+
+        void Reselect(System.Windows.Controls.ItemsControl ic)
+        {
+            if (ic.ItemsSource is not IEnumerable<CameraViewModel> items) return;
+            var list = items.ToList();
+            foreach (var vm in list) vm.IsSelected = vm.Id == id;
+            ic.ItemsSource = list; // reassign forces WPF to re-evaluate bindings
+        }
+
+        Reselect(icBackCameras);
+        Reselect(icFrontCameras);
+    }
 
     private async Task SendConfigureAndStartAsync()
     {

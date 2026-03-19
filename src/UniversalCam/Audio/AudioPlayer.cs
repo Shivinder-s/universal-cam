@@ -4,6 +4,9 @@ using UniversalCam.Core.Audio;
 
 namespace UniversalCam.Audio;
 
+/// <summary>Represents a WASAPI render endpoint.</summary>
+public sealed record AudioDeviceInfo(string Id, string Name);
+
 /// <summary>
 /// Plays decoded PCM audio via WASAPI shared mode.
 /// Feed <see cref="PcmFrame"/> objects from <see cref="Core.Audio.AacDecoder.PcmDecoded"/>.
@@ -17,7 +20,8 @@ public sealed class AudioPlayer : IDisposable
     private WasapiOut?            _out;
     private BufferedWaveProvider? _buffer;
     private readonly object       _initLock = new();
-    private bool _started;
+    private bool    _started;
+    private string? _deviceId;
 
     // ── Volume / mute ─────────────────────────────────────────────────────────
 
@@ -38,6 +42,37 @@ public sealed class AudioPlayer : IDisposable
     public float CurrentRms { get; private set; }
 
     // ── Public API ────────────────────────────────────────────────────────────
+
+    /// <summary>Returns all active WASAPI render endpoints.</summary>
+    public static IReadOnlyList<AudioDeviceInfo> GetOutputDevices()
+    {
+        using var enumerator = new MMDeviceEnumerator();
+        return enumerator
+            .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+            .Select(d => new AudioDeviceInfo(d.ID, d.FriendlyName))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Selects a specific output device by its WASAPI ID.
+    /// Pass null to revert to the default device.
+    /// Takes effect on the next frame if already playing.
+    /// </summary>
+    public void SetDevice(string? deviceId)
+    {
+        lock (_initLock)
+        {
+            _deviceId = deviceId;
+            if (_started)
+            {
+                _out?.Stop();
+                _out?.Dispose();
+                _out     = null;
+                _buffer  = null;
+                _started = false;
+            }
+        }
+    }
 
     public void Feed(PcmFrame frame)
     {
@@ -68,7 +103,18 @@ public sealed class AudioPlayer : IDisposable
                 BufferDuration          = TimeSpan.FromSeconds(2),
                 DiscardOnBufferOverflow = true,
             };
-            _out = new WasapiOut(AudioClientShareMode.Shared, 80);
+
+            if (_deviceId != null)
+            {
+                using var enumerator = new MMDeviceEnumerator();
+                var device = enumerator.GetDevice(_deviceId);
+                _out = new WasapiOut(device, AudioClientShareMode.Shared, true, 80);
+            }
+            else
+            {
+                _out = new WasapiOut(AudioClientShareMode.Shared, 80);
+            }
+
             _out.Init(_buffer);
             _out.Volume = _isMuted ? 0f : 1f;
             _out.Play();

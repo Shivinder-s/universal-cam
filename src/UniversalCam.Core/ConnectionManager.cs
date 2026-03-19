@@ -39,6 +39,9 @@ public sealed class ConnectionManager : IAsyncDisposable
     /// Fires with one-way latency (ms) after each Pong response.
     public event EventHandler<int>? LatencyUpdated;
 
+    /// Fires when the iPhone reports a device orientation change. Value is "portrait" or "landscape".
+    public event EventHandler<string>? OrientationChanged;
+
     // ── State ────────────────────────────────────────────────────────────────
 
     public TransportState State { get; private set; } = TransportState.Idle;
@@ -134,10 +137,20 @@ public sealed class ConnectionManager : IAsyncDisposable
 
     // ── Private ──────────────────────────────────────────────────────────────
 
+    private int _frameCount;
+
+    private void OnFrameReceived(TransportType type, MediaFrame frame)
+    {
+        int n = System.Threading.Interlocked.Increment(ref _frameCount);
+        if (n == 1 || n % 150 == 0)
+            Console.WriteLine($"[ConnectionManager] {type} frame #{n}: {(frame.IsVideo ? "video" : "audio")} {frame.Payload.Length} bytes keyframe={frame.Header.IsKeyframe}");
+        FrameReceived?.Invoke(this, frame);
+    }
+
     private void WireTransport(ITransport transport, TransportType type)
     {
         transport.StateChanged          += (_, s) => OnTransportStateChanged(transport, type, s);
-        transport.FrameReceived         += (_, f) => FrameReceived?.Invoke(this, f);
+        transport.FrameReceived         += (_, f) => OnFrameReceived(type, f);
         transport.ControlMessageReceived += (_, m) => OnControlMessage(transport, type, m);
     }
 
@@ -213,6 +226,10 @@ public sealed class ConnectionManager : IAsyncDisposable
             case Ping ping:
                 // Respond so iOS can measure its round-trip latency
                 _ = transport.SendControlAsync(new Pong { Ts = ping.Ts });
+                break;
+
+            case Protocol.OrientationChanged oc:
+                OrientationChanged?.Invoke(this, oc.Orientation);
                 break;
         }
     }

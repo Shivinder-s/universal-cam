@@ -1,14 +1,13 @@
 using System.Runtime.InteropServices;
-using Sdcb.FFmpeg.Codecs;
 using Sdcb.FFmpeg.Raw;
-using Sdcb.FFmpeg.Utils;
+using UniversalCam.Core;
 using UniversalCam.Core.Protocol;
 
 namespace UniversalCam.Core.Video;
 
 /// <summary>
 /// Decodes H.264 Annex B NAL units (received from the iPhone) into BGRA32 frames
-/// using FFmpeg (Sdcb.FFmpeg) via the libavcodec H.264 software decoder.
+/// using raw FFmpeg P/Invoke — single-threaded, no managed callbacks.
 ///
 /// Thread safety: Feed() must be called from a single thread.
 /// FrameDecoded events fire synchronously on that thread.
@@ -17,13 +16,12 @@ public sealed class H264Decoder : IDisposable
 {
     public event EventHandler<DecodedFrame>? FrameDecoded;
 
-    private FfmpegDecoder? _decoder;
-    private bool           _initialized;
+    private RawFfmpegDecoder? _decoder;
+    private bool              _initialized;
 
-    /// <summary>
-    /// Feed one H.264 Annex B <see cref="MediaFrame"/>. Zero or more
-    /// <see cref="FrameDecoded"/> events may fire synchronously.
-    /// </summary>
+    // Set from any thread; applied in Feed() before the next decode (same decoder thread).
+    private int _resetPending;
+
     public void Feed(MediaFrame frame)
     {
         if (!frame.IsVideo) return;
@@ -32,7 +30,7 @@ public sealed class H264Decoder : IDisposable
         {
             try
             {
-                _decoder = new FfmpegDecoder();
+                _decoder = new RawFfmpegDecoder();
                 _decoder.FrameDecoded += (_, f) => FrameDecoded?.Invoke(this, f);
             }
             catch (Exception ex)
@@ -42,10 +40,15 @@ public sealed class H264Decoder : IDisposable
             _initialized = true;
         }
 
+        if (System.Threading.Interlocked.Exchange(ref _resetPending, 0) != 0)
+            _decoder?.Reset();
+
         _decoder?.Decode(frame.Payload, frame.Header.PtsUs, frame.Header.IsKeyframe);
     }
 
-    /// <summary>Flush decoder state on camera switch; waits for next keyframe before emitting frames.</summary>
+    /// <summary>Thread-safe: schedules a flush before the next frame decode.</summary>
+    public void RequestReset() => System.Threading.Interlocked.Exchange(ref _resetPending, 1);
+
     public void Reset() => _decoder?.Reset();
 
     public void Dispose()
@@ -61,8 +64,6 @@ public sealed class DecodedFrame
     public int    Width  { get; }
     public int    Height { get; }
     public long   PtsUs  { get; }
-
-    /// BGRA32 pixels: Width * Height * 4 bytes.
     public byte[] Data   { get; }
 
     public DecodedFrame(int width, int height, long ptsUs, byte[] data)
@@ -75,153 +76,161 @@ public sealed class DecodedFrame
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FFmpeg H.264 decoder (libavcodec via Sdcb.FFmpeg)
+// Raw FFmpeg P/Invoke — bypasses all Sdcb.FFmpeg managed wrappers so no
+// managed delegate can be installed on native FFmpeg threads.
 // ─────────────────────────────────────────────────────────────────────────────
 
-internal sealed class FfmpegDecoder : IDisposable
+internal sealed unsafe class RawFfmpegDecoder : IDisposable
 {
     public event EventHandler<DecodedFrame>? FrameDecoded;
 
-    private readonly CodecContext _codecCtx;
-    private readonly Frame        _yuvFrame;
+    private AVCodecContext* _ctx;
+    private AVFrame*        _frame;
+    private bool            _waitingForKeyframe = true;
+    private int             _consecutiveErrors;
 
-    private nint _swsCtx;            // SwsContext* stored as nint (0 = null)
-    private int  _swsW, _swsH;
-    private int  _swsFmt   = -1;
-    private int  _swsDispW;          // display width after SAR correction
-    private bool _waitingForKeyframe = true; // drop P-frames until a keyframe arrives
-    private int  _consecutiveErrors  = 0;
+    public RawFfmpegDecoder()
+    {
+        // Silence FFmpeg log output — AV_LOG_QUIET = -8
+        // This also ensures no log callback ever fires on a native thread.
+        NativeFFmpeg.av_log_set_level(-8);
 
-    /// <summary>
-    /// Called when the iOS camera changes. Flushes the FFmpeg decoder state so stale
-    /// reference frames from the previous session don't corrupt the new stream.
-    /// </summary>
-    public unsafe void Reset()
+        AVCodec* codec = NativeFFmpeg.avcodec_find_decoder(AVCodecID.H264);
+        if (codec == null) throw new Exception("H.264 codec not found");
+
+        _ctx = NativeFFmpeg.avcodec_alloc_context3(codec);
+        if (_ctx == null) throw new Exception("avcodec_alloc_context3 failed");
+
+        // Single-threaded decode: prevents FFmpeg from spawning native OS threads
+        // that are not CLR threads. A native non-CLR thread entering managed code
+        // (e.g. via a managed log callback) causes Fatal CLR error 0x80131506.
+        _ctx->thread_count = 1;
+        _ctx->thread_type  = 0; // FF_THREAD_FRAME | FF_THREAD_SLICE — disable both
+
+        int hr = NativeFFmpeg.avcodec_open2(_ctx, codec, null);
+        if (hr < 0) throw new Exception($"avcodec_open2 failed: {hr}");
+
+        _frame = NativeFFmpeg.av_frame_alloc();
+        if (_frame == null) throw new Exception("av_frame_alloc failed");
+    }
+
+    public void Reset()
     {
         _waitingForKeyframe = true;
         _consecutiveErrors  = 0;
-        ffmpeg.avcodec_flush_buffers(_codecCtx);
+        NativeFFmpeg.avcodec_flush_buffers(_ctx);
     }
 
-    public FfmpegDecoder()
+    public void Decode(byte[] annexBNalUnits, long ptsUs, bool isKeyframe)
     {
-        var codec = Codec.FindDecoderById(Sdcb.FFmpeg.Raw.AVCodecID.H264);
-        _codecCtx = new CodecContext(codec);
-        _codecCtx.Open(codec);
-        _yuvFrame = new Frame();
-    }
-
-    public unsafe void Decode(byte[] annexBNalUnits, long ptsUs, bool isKeyframe)
-    {
-        // Don't feed P-frames before the first keyframe — they'll decode to garbage
-        // and can crash sws_scale via null plane pointers.
         if (_waitingForKeyframe)
         {
             if (!isKeyframe) return;
             _waitingForKeyframe = false;
         }
 
-        using var packet = new Packet();
-        AVPacket* raw = packet;
-
-        // Allocate an FFmpeg-managed buffer so av_packet_free can safely release it.
-        if (ffmpeg.av_new_packet(raw, annexBNalUnits.Length) < 0) return;
-        Marshal.Copy(annexBNalUnits, 0, (nint)raw->data, annexBNalUnits.Length);
-        raw->pts = ptsUs;
-
-        try { _codecCtx.SendPacket(packet); }
-        catch { return; } // skip corrupt/invalid input silently
-
-        while (true)
+        AVPacket* pkt = NativeFFmpeg.av_packet_alloc();
+        if (pkt == null) return;
+        try
         {
-            var result = _codecCtx.ReceiveFrame(_yuvFrame);
-            if (result == CodecResult.Again || result == CodecResult.EOF) break;
-            if ((int)result < 0)
+            if (NativeFFmpeg.av_new_packet(pkt, annexBNalUnits.Length) < 0) return;
+            fixed (byte* src = annexBNalUnits)
+                Buffer.MemoryCopy(src, pkt->data, annexBNalUnits.Length, annexBNalUnits.Length);
+            pkt->pts = ptsUs;
+
+            int sendResult = NativeFFmpeg.avcodec_send_packet(_ctx, pkt);
+            if (sendResult < 0) return;
+
+            while (true)
             {
-                // Too many consecutive decode errors → flush and wait for next keyframe.
-                // This prevents the decoder from producing garbage frames with invalid
-                // strides or data pointers that crash sws_scale.
-                if (++_consecutiveErrors >= 10)
+                int recvResult = NativeFFmpeg.avcodec_receive_frame(_ctx, _frame);
+                if (recvResult == -11 || recvResult == NativeFFmpeg.AVERROR_EOF) break; // EAGAIN or EOF
+                if (recvResult < 0)
                 {
-                    ffmpeg.avcodec_flush_buffers(_codecCtx);
-                    _waitingForKeyframe = true;
-                    _consecutiveErrors  = 0;
+                    if (++_consecutiveErrors >= 10)
+                    {
+                        NativeFFmpeg.avcodec_flush_buffers(_ctx);
+                        _waitingForKeyframe = true;
+                        _consecutiveErrors  = 0;
+                    }
+                    break;
                 }
-                break;
+                _consecutiveErrors = 0;
+                EmitFrame(ptsUs);
+                NativeFFmpeg.av_frame_unref(_frame);
             }
-            _consecutiveErrors = 0;
-            EmitFrame(ptsUs);
-            _yuvFrame.Unref();
+        }
+        finally
+        {
+            NativeFFmpeg.av_packet_free(&pkt);
         }
     }
 
-    private unsafe void EmitFrame(long ptsUs)
+    private void EmitFrame(long ptsUs)
     {
-        int w   = _yuvFrame.Width;
-        int h   = _yuvFrame.Height;
-        int fmt = _yuvFrame.Format;
+        int w = _frame->width;
+        int h = _frame->height;
         if (w <= 0 || h <= 0) return;
+        if ((byte*)_frame->data[0] == null) return;
+        if (_frame->linesize[0] <= 0) return;
 
-        // Apply SAR correction: H.264 VUI may declare non-square pixels.
-        // sws_getContext does NOT auto-correct SAR when src/dst dims are identical,
-        // so compute the display width explicitly and scale the output accordingly.
-        AVRational sar = _yuvFrame.SampleAspectRatio;
-        int dispW = (sar.Num > 0 && sar.Den > 0 && sar.Num != sar.Den)
-            ? (int)Math.Round((double)w * sar.Num / sar.Den)
-            : w;
+        // Pure C# YUV→BGRA — no sws_scale, no native crash possible.
+        // FFmpeg's H.264 software decoder always outputs yuv420p (fmt=0)
+        // or yuvj420p (fmt=12); both use the same planar layout.
+        byte[] bgra = new byte[w * h * 4];
+        Yuv420pToBgra(
+            (byte*)_frame->data[0], _frame->linesize[0],
+            (byte*)_frame->data[1], _frame->linesize[1],
+            (byte*)_frame->data[2], _frame->linesize[2],
+            bgra, w, h);
 
-        // Lazily create/recreate sws context on dimension or format change.
-        // sws_scale handles BT.709 color matrix for HD content.
-        if (_swsCtx == 0 || _swsW != w || _swsH != h || _swsFmt != fmt)
-        {
-            if (_swsCtx != 0) ffmpeg.sws_freeContext((SwsContext*)_swsCtx);
-            var ctx = ffmpeg.sws_getContext(
-                w, h, (AVPixelFormat)fmt,
-                dispW, h, AVPixelFormat.Bgra,
-                (int)SWS.Bilinear, null, null, null);
-            _swsCtx   = (nint)ctx;
-            _swsW     = w;
-            _swsH     = h;
-            _swsFmt   = fmt;
-            _swsDispW = dispW;
-        }
-
-        // Guard against corrupted frames — sws_scale will SIGSEGV if any of these are bad.
-        if (_swsCtx == 0) return;
-        if ((byte*)_yuvFrame.Data[0] == null) return;
-        if (_yuvFrame.Linesize[0] <= 0) return; // invalid stride → garbage/crash
-
-        byte[] output = new byte[_swsDispW * h * 4];
-
-        // Sdcb.FFmpeg's sws_scale overload takes byte*[] / int[] (managed arrays).
-        // P/Invoke pins managed arrays for the duration of the native call, so GC
-        // cannot move them while sws_scale is writing — no CLR corruption risk.
-        fixed (byte* dst = output)
-        {
-            var srcSlice  = new byte*[8];
-            var srcStride = new int[8];
-            srcSlice[0]  = (byte*)_yuvFrame.Data[0];
-            srcSlice[1]  = (byte*)_yuvFrame.Data[1];
-            srcSlice[2]  = (byte*)_yuvFrame.Data[2];
-            srcStride[0] = _yuvFrame.Linesize[0];
-            srcStride[1] = _yuvFrame.Linesize[1];
-            srcStride[2] = _yuvFrame.Linesize[2];
-
-            var dstSlice  = new byte*[8];
-            var dstStride = new int[8];
-            dstSlice[0]  = dst;
-            dstStride[0] = _swsDispW * 4;
-
-            ffmpeg.sws_scale((SwsContext*)_swsCtx, srcSlice, srcStride, 0, h, dstSlice, dstStride);
-        }
-
-        FrameDecoded?.Invoke(this, new DecodedFrame(_swsDispW, h, ptsUs, output));
+        // Emit frame as-is (w×h). Portrait frames (h > w) are cropped/panned
+        // by the consumer (MainWindow) so the user can choose which part to show.
+        FrameDecoded?.Invoke(this, new DecodedFrame(w, h, ptsUs, bgra));
     }
 
-    public unsafe void Dispose()
+    private static unsafe void Yuv420pToBgra(
+        byte* yPlane,  int yStride,
+        byte* uPlane,  int uStride,
+        byte* vPlane,  int vStride,
+        byte[] dst, int w, int h)
     {
-        if (_swsCtx != 0) { ffmpeg.sws_freeContext((SwsContext*)_swsCtx); _swsCtx = 0; }
-        _yuvFrame.Dispose();
-        _codecCtx.Dispose();
+        // BT.601 limited-range integer coefficients (same as sws_scale default for SD/HD)
+        // R = clamp((298*(Y-16)           + 409*(V-128) + 128) >> 8)
+        // G = clamp((298*(Y-16) - 100*(U-128) - 208*(V-128) + 128) >> 8)
+        // B = clamp((298*(Y-16) + 516*(U-128)           + 128) >> 8)
+        fixed (byte* dstPtr = dst)
+        {
+            for (int row = 0; row < h; row++)
+            {
+                byte* yRow = yPlane + row * yStride;
+                byte* uRow = uPlane + (row >> 1) * uStride;
+                byte* vRow = vPlane + (row >> 1) * vStride;
+                byte* d    = dstPtr + row * w * 4;
+
+                for (int col = 0; col < w; col++)
+                {
+                    int c = 298 * (yRow[col] - 16) + 128;
+                    int u = uRow[col >> 1] - 128;
+                    int v = vRow[col >> 1] - 128;
+
+                    int r = (c          + 409 * v) >> 8;
+                    int g = (c - 100 * u - 208 * v) >> 8;
+                    int b = (c + 516 * u          ) >> 8;
+
+                    d[col * 4 + 0] = (byte)(b < 0 ? 0 : b > 255 ? 255 : b);
+                    d[col * 4 + 1] = (byte)(g < 0 ? 0 : g > 255 ? 255 : g);
+                    d[col * 4 + 2] = (byte)(r < 0 ? 0 : r > 255 ? 255 : r);
+                    d[col * 4 + 3] = 255;
+                }
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_frame != null) { var f = _frame; _frame = null; NativeFFmpeg.av_frame_free(&f); }
+        if (_ctx   != null) { var c = _ctx;   _ctx   = null; NativeFFmpeg.avcodec_free_context(&c); }
     }
 }
+

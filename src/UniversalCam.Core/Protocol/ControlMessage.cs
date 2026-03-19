@@ -44,9 +44,10 @@ public abstract record ControlMessage
             "switch_camera_ack" => doc.Deserialize<SwitchCameraAck>(_options),
             "list_cameras"      => new ListCameras(),
             "available_cameras" => doc.Deserialize<AvailableCameras>(_options),
-            "ping"              => doc.Deserialize<Ping>(_options),
-            "pong"              => doc.Deserialize<Pong>(_options),
-            _                   => null,
+            "ping"                => doc.Deserialize<Ping>(_options),
+            "pong"                => doc.Deserialize<Pong>(_options),
+            "orientation_changed" => doc.Deserialize<OrientationChanged>(_options),
+            _                     => null,
         };
     }
 }
@@ -146,6 +147,14 @@ public sealed record Pong : ControlMessage
     public override string Type => "pong";
 
     [JsonPropertyName("ts")] public long Ts { get; init; }
+}
+
+/// iPhone reports device orientation changed. "portrait" | "landscape"
+public sealed record OrientationChanged : ControlMessage
+{
+    public override string Type => "orientation_changed";
+
+    [JsonPropertyName("orientation")] public string Orientation { get; init; } = "landscape";
 }
 
 // ── Shared types ─────────────────────────────────────────────────────────────

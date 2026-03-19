@@ -55,6 +55,13 @@ final class ConnectionManager: ObservableObject {
         bindUSBTransport()
         bindEncoder()
         checkPermissions()
+        setupOrientationObserver()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self,
+            name: UIDevice.orientationDidChangeNotification, object: nil)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
     }
 
     // MARK: - Public API
@@ -243,6 +250,7 @@ final class ConnectionManager: ObservableObject {
                 capabilities: ["h264", "aac_lc", "stereo_audio"]
             )
             wifiTransport.sendControl(hello)
+            sendCurrentOrientation()
             DispatchQueue.main.async { self.state = .connected }
             print("[ConnectionManager] QUIC ready — sent Hello proactively")
             sendAvailableCameras()
@@ -397,6 +405,7 @@ final class ConnectionManager: ObservableObject {
                 capabilities: ["h264", "aac_lc", "stereo_audio"]
             )
             sendControl(hello)
+            sendCurrentOrientation()
             DispatchQueue.main.async { self.state = .connected }
             print("[ConnectionManager] Connected to peer via \(transport.rawValue)")
 
@@ -465,6 +474,9 @@ final class ConnectionManager: ObservableObject {
         case .availableCameras:
             break
 
+        case .orientationChanged:
+            break // outbound-only from iOS; ignore if PC ever echoes it
+
         case .pong(let ts):
             handlePong(ts: ts)
 
@@ -473,6 +485,35 @@ final class ConnectionManager: ObservableObject {
 
         default:
             break
+        }
+    }
+
+    // MARK: - Orientation
+
+    private func setupOrientationObserver() {
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(deviceOrientationDidChange),
+            name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func deviceOrientationDidChange() {
+        let o = UIDevice.current.orientation
+        guard o.isPortrait || o.isLandscape else { return } // ignore face-up/down/unknown
+        let name = o.isPortrait ? "portrait" : "landscape"
+        sendControl(.orientationChanged(orientation: name))
+        print("[ConnectionManager] Orientation → \(name)")
+    }
+
+    /// Sends the current device orientation immediately (call after hello so Windows
+    /// knows the orientation before the first video frame is decoded).
+    private func sendCurrentOrientation() {
+        let o = UIDevice.current.orientation
+        if o.isPortrait || o.isLandscape {
+            sendControl(.orientationChanged(orientation: o.isPortrait ? "portrait" : "landscape"))
         }
     }
 
@@ -506,26 +547,30 @@ enum ControlMessage: Codable {
     case availableCameras(cameras: [CameraInfo], currentCameraID: String)
     case ping(ts: Int64)
     case pong(ts: Int64)
+    /// iOS → PC: device orientation changed. orientation = "portrait" | "landscape"
+    case orientationChanged(orientation: String)
 
     private enum CodingKeys: String, CodingKey {
         case type, deviceName, capabilities, resolution, fps, codec, bitrate, ts
         case cameraID, cameraName, cameras, currentCameraID
+        case orientation
     }
 
     var type: String {
         switch self {
-        case .hello:            return "hello"
-        case .welcome:          return "welcome"
-        case .configure:        return "configure"
-        case .configureAck:     return "configure_ack"
-        case .startStream:      return "start_stream"
-        case .stopStream:       return "stop_stream"
-        case .switchCamera:     return "switch_camera"
-        case .switchCameraAck:  return "switch_camera_ack"
-        case .listCameras:      return "list_cameras"
-        case .availableCameras: return "available_cameras"
-        case .ping:             return "ping"
-        case .pong:             return "pong"
+        case .hello:               return "hello"
+        case .welcome:             return "welcome"
+        case .configure:           return "configure"
+        case .configureAck:        return "configure_ack"
+        case .startStream:         return "start_stream"
+        case .stopStream:          return "stop_stream"
+        case .switchCamera:        return "switch_camera"
+        case .switchCameraAck:     return "switch_camera_ack"
+        case .listCameras:         return "list_cameras"
+        case .availableCameras:    return "available_cameras"
+        case .ping:                return "ping"
+        case .pong:                return "pong"
+        case .orientationChanged:  return "orientation_changed"
         }
     }
 
@@ -561,6 +606,8 @@ enum ControlMessage: Codable {
             try container.encode(currentCameraID, forKey: .currentCameraID)
         case .ping(let ts), .pong(let ts):
             try container.encode(ts, forKey: .ts)
+        case .orientationChanged(let orientation):
+            try container.encode(orientation, forKey: .orientation)
         }
     }
 
@@ -608,6 +655,9 @@ enum ControlMessage: Codable {
         case "pong":
             let ts = try container.decode(Int64.self, forKey: .ts)
             self = .pong(ts: ts)
+        case "orientation_changed":
+            let orientation = try container.decode(String.self, forKey: .orientation)
+            self = .orientationChanged(orientation: orientation)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,

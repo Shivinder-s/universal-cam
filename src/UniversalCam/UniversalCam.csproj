@@ -24,6 +24,11 @@
         <Resource Include="Assets\wordmark.png" />
     </ItemGroup>
 
+    <!-- Reference WinForms assembly for NotifyIcon — without UseWindowsForms so no implicit usings are injected -->
+    <ItemGroup>
+        <FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
+    </ItemGroup>
+
     <ItemGroup>
         <ProjectReference Include="..\UniversalCam.Core\UniversalCam.Core.csproj" />
         <ProjectReference Include="..\UniversalCam.VirtualCamera\UniversalCam.VirtualCamera.csproj" />

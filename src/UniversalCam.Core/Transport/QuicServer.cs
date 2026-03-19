@@ -31,17 +31,10 @@ public sealed class QuicServer : ITransport
     private QuicListener?   _listener;
     private QuicConnection? _connection;
     private QuicStream?     _responseStream; // the bidirectional stream iOS opened; we write back on it
-    private readonly FrameParser _parser = new();
     private CancellationTokenSource? _cts;
     // Serialize writes: QuicStream doesn't allow concurrent WriteAsync/FlushAsync calls.
     // Configure (UI thread) and StartStream (QUIC receive thread) can overlap otherwise.
     private readonly SemaphoreSlim _writeLock = new(1, 1);
-
-    public QuicServer()
-    {
-        _parser.ControlMessageParsed += (_, msg) => ControlMessageReceived?.Invoke(this, msg);
-        _parser.FrameParsed          += (_, frame) => FrameReceived?.Invoke(this, frame);
-    }
 
     public async Task StartAsync(CancellationToken ct = default)
     {
@@ -163,10 +156,23 @@ public sealed class QuicServer : ITransport
             while (!ct.IsCancellationRequested)
             {
                 var stream = await connection.AcceptInboundStreamAsync(ct);
-                // Use the first writable (bidirectional) stream iOS opened as the response channel.
-                if (_responseStream is null && stream.CanWrite)
-                    _responseStream = stream;
-                _ = ReadStreamAsync(stream, ct);
+                // Always update to the latest writable (bidirectional) stream iOS opened.
+                // iOS may open a new control stream after a soft reconnect; we need to
+                // reply on whichever stream it's currently listening to.
+                if (stream.CanWrite)
+                {
+                    await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+                    try { _responseStream = stream; }
+                    finally { _writeLock.Release(); }
+                }
+                // Each QUIC stream gets its own FrameParser to avoid concurrent access on
+                // the shared buffer — iOS opens separate streams for control and media,
+                // and concurrent List<byte>.AddRange calls from multiple ReadStreamAsync
+                // tasks would corrupt the buffer, causing CLR crash 0x80131506 and dropped frames.
+                var parser = new FrameParser();
+                parser.ControlMessageParsed += (_, msg) => ControlMessageReceived?.Invoke(this, msg);
+                parser.FrameParsed          += (_, frame) => FrameReceived?.Invoke(this, frame);
+                _ = ReadStreamAsync(stream, parser, ct);
             }
         }
         catch (OperationCanceledException) { }
@@ -174,14 +180,11 @@ public sealed class QuicServer : ITransport
         {
             Console.WriteLine($"[QuicServer] Stream accept error: {ex.Message}");
             if (connection == _connection)
-            {
                 SetState(TransportState.Disconnected);
-                _parser.Reset();
-            }
         }
     }
 
-    private async Task ReadStreamAsync(QuicStream stream, CancellationToken ct)
+    private async Task ReadStreamAsync(QuicStream stream, FrameParser parser, CancellationToken ct)
     {
         var buffer = new byte[65536];
         try
@@ -189,7 +192,7 @@ public sealed class QuicServer : ITransport
             int read;
             while ((read = await stream.ReadAsync(buffer, ct)) > 0)
             {
-                _parser.Feed(buffer.AsSpan(0, read));
+                parser.Feed(buffer.AsSpan(0, read));
             }
         }
         catch (Exception ex)

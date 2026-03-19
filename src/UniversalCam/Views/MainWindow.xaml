@@ -17,7 +17,7 @@
         <SolidColorBrush x:Key="UsbBadgeBrush"  Color="#FF9F0A" />
         <SolidColorBrush x:Key="WifiBadgeBrush" Color="#0A84FF" />
 
-        <!-- Camera button — passthrough, styling in DataTemplate -->
+        <!-- Camera button — Fix 2A: Border Background="Transparent" enables full hit-test area -->
         <Style x:Key="CameraRowButton" TargetType="Button">
             <Setter Property="Background"                 Value="Transparent" />
             <Setter Property="BorderThickness"            Value="0" />
@@ -27,7 +27,9 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <ContentPresenter />
+                        <Border Background="Transparent">
+                            <ContentPresenter />
+                        </Border>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
@@ -146,16 +148,22 @@
         </Grid.RowDefinitions>
 
         <!-- ══ VIDEO AREA ═══════════════════════════════════════════════════════ -->
-        <Grid Grid.Row="0" Background="#000000">
+        <!-- Fix 3: ClipToBounds so the zoom ScaleTransform clips to the video area -->
+        <Grid Grid.Row="0" Background="#000000" ClipToBounds="True">
 
+            <!-- Fix 3: RenderTransform (zoom) separate from LayoutTransform (rotate) -->
             <Image x:Name="imgPreview"
                    HorizontalAlignment="Stretch"
                    VerticalAlignment="Stretch"
                    Stretch="Uniform"
-                   RenderOptions.BitmapScalingMode="LowQuality">
+                   RenderOptions.BitmapScalingMode="HighQuality"
+                   RenderTransformOrigin="0.5,0.5">
                 <Image.LayoutTransform>
                     <RotateTransform x:Name="imgRotation" Angle="0" />
                 </Image.LayoutTransform>
+                <Image.RenderTransform>
+                    <ScaleTransform x:Name="imgZoom" ScaleX="1" ScaleY="1" />
+                </Image.RenderTransform>
             </Image>
 
             <!-- Waiting placeholder -->
@@ -173,7 +181,7 @@
                            Text="Waiting for iPhone…" />
             </StackPanel>
 
-            <!-- Resolution + latency pill (bottom-left) -->
+            <!-- Resolution + latency + fps pill (bottom-left) -->
             <Border x:Name="pnlVideoInfo"
                     HorizontalAlignment="Left"
                     VerticalAlignment="Bottom"
@@ -211,6 +219,15 @@
                         BorderThickness="0,0,0,1"
                         Padding="16,0">
                     <DockPanel Height="30">
+                        <!-- Fix 5B: Copy IP button -->
+                        <Button x:Name="btnCopyIp"
+                                DockPanel.Dock="Right"
+                                Content="Copy"
+                                Style="{StaticResource DockButton}"
+                                Padding="7,2"
+                                FontSize="10"
+                                Margin="6,0,0,0"
+                                Click="OnCopyIpClicked" />
                         <TextBlock x:Name="txtIpHint"
                                    DockPanel.Dock="Right"
                                    FontSize="11" Foreground="#3A3A3C"
@@ -242,20 +259,27 @@
                     </DockPanel>
                 </Border>
 
-                <!-- Controls row: Cameras | Quality | Actions -->
+                <!-- Controls row: Cameras | Quality | Framing | Audio -->
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" MinWidth="160" /> <!-- Cameras (fills remaining) -->
-                        <ColumnDefinition Width="1" />                <!-- Divider -->
-                        <ColumnDefinition Width="Auto" />             <!-- Quality -->
-                        <ColumnDefinition Width="1" />                <!-- Divider -->
-                        <ColumnDefinition Width="Auto" />             <!-- Actions -->
+                        <ColumnDefinition Width="*" MinWidth="160" /> <!-- Col 0: Cameras -->
+                        <ColumnDefinition Width="1" />                <!-- Col 1: Divider -->
+                        <ColumnDefinition Width="Auto" />             <!-- Col 2: Quality -->
+                        <ColumnDefinition Width="1" />                <!-- Col 3: Divider -->
+                        <ColumnDefinition Width="Auto" />             <!-- Col 4: Framing -->
+                        <ColumnDefinition Width="1" />                <!-- Col 5: Divider -->
+                        <ColumnDefinition Width="Auto" />             <!-- Col 6: Audio -->
                     </Grid.ColumnDefinitions>
 
-                    <!-- CAMERAS -->
+                    <!-- CAMERAS — Fix 4: "CAMERAS" label + Rotate moved here -->
                     <StackPanel Grid.Column="0"
                                 Margin="16,10,12,10"
                                 VerticalAlignment="Center">
+
+                        <TextBlock Text="CAMERAS"
+                                   FontSize="9" FontWeight="SemiBold"
+                                   Foreground="#48484A"
+                                   Margin="0,0,0,6" />
 
                         <StackPanel x:Name="pnlBack"
                                     Orientation="Horizontal"
@@ -330,6 +354,14 @@
                             </ItemsControl>
                         </StackPanel>
 
+                        <!-- Fix 4: Rotate moved to camera section -->
+                        <Button x:Name="btnRotate"
+                                Style="{StaticResource DockButton}"
+                                Content="⟳  Rotate"
+                                HorizontalAlignment="Left"
+                                Margin="0,6,0,0"
+                                Click="OnRotateClicked" />
+
                     </StackPanel>
 
                     <!-- Divider -->
@@ -341,7 +373,6 @@
                                    FontSize="9" FontWeight="SemiBold"
                                    Foreground="#48484A"
                                    Margin="0,0,0,6" />
-                        <!-- 3 + 2 pill grid -->
                         <UniformGrid Columns="3" Rows="2">
                             <RadioButton x:Name="rb720p60"
                                          Content="720p" Tag="60fps"
@@ -369,7 +400,6 @@
                                          GroupName="Quality"
                                          Style="{StaticResource QualityPill}"
                                          Checked="OnQualityChanged" />
-                            <!-- 6th cell intentionally empty -->
                             <Border />
                         </UniformGrid>
                     </StackPanel>
@@ -377,30 +407,133 @@
                     <!-- Divider -->
                     <Rectangle Grid.Column="3" Fill="#2C2C2E" />
 
-                    <!-- ACTIONS -->
+                    <!-- FRAMING -->
                     <StackPanel Grid.Column="4" Margin="16,10" VerticalAlignment="Center">
+                        <TextBlock Text="FRAMING"
+                                   FontSize="9" FontWeight="SemiBold"
+                                   Foreground="#48484A"
+                                   Margin="0,0,0,6" />
+
+                        <!-- Portrait framing: mini preview + vertical pan slider.
+                             Only shown when the source frame is portrait (h > w). -->
+                        <StackPanel x:Name="pnlPortraitFraming"
+                                    Orientation="Horizontal"
+                                    Visibility="Collapsed"
+                                    Margin="0,0,0,8">
+
+                            <!-- Mini portrait-frame preview canvas -->
+                            <Canvas Width="40" Height="72"
+                                    Background="#1C1C1E"
+                                    SnapsToDevicePixels="True">
+                                <!-- Dimmed area ABOVE the crop window -->
+                                <Rectangle x:Name="rctPortraitAbove"
+                                           Canvas.Left="0" Canvas.Top="0"
+                                           Width="40" Height="36"
+                                           Fill="#88000000" />
+                                <!-- The crop window (landscape slice indicator) -->
+                                <Rectangle x:Name="rctCropWindow"
+                                           Canvas.Left="0" Canvas.Top="36"
+                                           Width="40" Height="22"
+                                           Fill="Transparent"
+                                           Stroke="#0A84FF"
+                                           StrokeThickness="1.5" />
+                                <!-- Dimmed area BELOW the crop window -->
+                                <Rectangle x:Name="rctPortraitBelow"
+                                           Canvas.Left="0" Canvas.Top="58"
+                                           Width="40" Height="14"
+                                           Fill="#88000000" />
+                            </Canvas>
+
+                            <!-- Vertical pan slider (top = 0, bottom = 1) -->
+                            <Slider x:Name="sldrPortraitCrop"
+                                    Orientation="Vertical"
+                                    Minimum="0" Maximum="1" Value="0.5"
+                                    Height="72" Width="20"
+                                    Margin="6,0,0,0"
+                                    IsDirectionReversed="True"
+                                    VerticalAlignment="Center"
+                                    ValueChanged="OnPortraitCropChanged" />
+
+                            <TextBlock Text="Pan"
+                                       FontSize="9" Foreground="#636366"
+                                       VerticalAlignment="Center"
+                                       Margin="4,0,0,0" />
+                        </StackPanel>
+
+                        <!-- Landscape zoom row (always visible) -->
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Zoom"
+                                       FontSize="10" Foreground="#636366"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,6,0" />
+                            <Slider x:Name="sldrZoom"
+                                    Minimum="1.0" Maximum="2.0" Value="1.0"
+                                    Width="90"
+                                    VerticalAlignment="Center"
+                                    ValueChanged="OnZoomChanged" />
+                            <TextBlock x:Name="txtZoomLevel"
+                                       Text="1.0×"
+                                       FontSize="10" Foreground="#636366"
+                                       VerticalAlignment="Center"
+                                       Margin="5,0,0,0" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <!-- Divider -->
+                    <Rectangle Grid.Column="5" Fill="#2C2C2E" />
+
+                    <!-- AUDIO — Fix 4: separated from camera controls + dark ComboBox -->
+                    <StackPanel Grid.Column="6" Margin="16,10" VerticalAlignment="Center">
                         <TextBlock Text="AUDIO"
                                    FontSize="9" FontWeight="SemiBold"
                                    Foreground="#48484A"
                                    Margin="0,0,0,6" />
+
+                        <TextBlock Text="Output"
+                                   FontSize="10" Foreground="#636366"
+                                   Margin="0,0,0,3" />
+                        <!-- Fix 4: ComboBox.Resources provides dark dropdown theme -->
+                        <ComboBox x:Name="cbAudioDevice"
+                                  Width="180" Height="24"
+                                  HorizontalAlignment="Left"
+                                  FontSize="11"
+                                  Margin="0,0,0,8"
+                                  Background="#2C2C2E"
+                                  Foreground="#EBEBF5"
+                                  BorderBrush="#3A3A3C"
+                                  SelectionChanged="OnAudioDeviceChanged">
+                            <ComboBox.Resources>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.WindowBrushKey}"        Color="#2C2C2E"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.WindowTextBrushKey}"    Color="#EBEBF5"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}"     Color="#0A84FF"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="White"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.ControlBrushKey}"       Color="#1C1C1E"/>
+                                <SolidColorBrush x:Key="{x:Static SystemColors.ControlTextBrushKey}"   Color="#EBEBF5"/>
+                            </ComboBox.Resources>
+                        </ComboBox>
+
+                        <CheckBox x:Name="chkPhoneAudio"
+                                  Content="iPhone Audio"
+                                  FontSize="11" Foreground="#EBEBF5"
+                                  IsChecked="True"
+                                  Margin="0,0,0,8"
+                                  Checked="OnPhoneAudioToggled"
+                                  Unchecked="OnPhoneAudioToggled" />
+
                         <ProgressBar x:Name="pbVolume"
-                                     Width="120" Height="3"
+                                     Width="180" Height="3"
                                      Minimum="0" Maximum="1" Value="0"
                                      IsEnabled="False"
                                      HorizontalAlignment="Left"
                                      Margin="0,0,0,8" />
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
-                            <Button x:Name="btnRotate"
-                                    Style="{StaticResource DockButton}"
-                                    Content="⟳  Rotate"
-                                    Margin="0,0,5,0"
-                                    Click="OnRotateClicked" />
-                            <ToggleButton x:Name="btnMute"
-                                          Style="{StaticResource DockToggle}"
-                                          Content="Mute"
-                                          IsEnabled="False"
-                                          Click="OnMuteClicked" />
-                        </StackPanel>
+
+                        <!-- Mute only (Rotate moved to camera section) -->
+                        <ToggleButton x:Name="btnMute"
+                                      Style="{StaticResource DockToggle}"
+                                      Content="Mute"
+                                      IsEnabled="False"
+                                      HorizontalAlignment="Left"
+                                      Click="OnMuteClicked" />
                     </StackPanel>
 
                 </Grid>

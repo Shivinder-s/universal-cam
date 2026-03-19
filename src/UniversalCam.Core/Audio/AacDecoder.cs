@@ -1,74 +1,83 @@
-using System.Runtime.InteropServices;
-using Sdcb.FFmpeg.Codecs;
 using Sdcb.FFmpeg.Raw;
-using Sdcb.FFmpeg.Utils;
+using UniversalCam.Core;
 
 namespace UniversalCam.Core.Audio;
 
 /// <summary>
 /// Decodes raw AAC-LC frames (received from the iPhone) to S16 interleaved PCM
-/// using FFmpeg libavcodec.
-///
-/// Input:  raw AAC-LC bytes at 44100 Hz stereo 128 kbps (~1024 samples/frame)
-/// Output: <see cref="PcmFrame"/> with S16 interleaved PCM via <see cref="PcmDecoded"/>
-///
-/// Thread safety: Decode() must be called from a single thread.
+/// using raw FFmpeg P/Invoke — single-threaded, no managed callbacks.
 /// </summary>
 public sealed class AacDecoder : IDisposable
 {
     public event EventHandler<PcmFrame>? PcmDecoded;
 
-    private readonly CodecContext _codecCtx;
-    private readonly Frame        _pcmFrame;
+    private unsafe AVCodecContext* _ctx;
+    private unsafe AVFrame*        _frame;
+    private bool _disposed;
 
-    public AacDecoder()
+    public unsafe AacDecoder()
     {
-        var codec = Codec.FindDecoderById(AVCodecID.Aac);
-        _codecCtx = new CodecContext(codec);
-        _codecCtx.Open(codec);
-        _pcmFrame = new Frame();
+        NativeFFmpeg.av_log_set_level(-8); // AV_LOG_QUIET — no native log callbacks
+
+        AVCodec* codec = NativeFFmpeg.avcodec_find_decoder(AVCodecID.Aac);
+        if (codec == null) throw new Exception("AAC codec not found");
+
+        _ctx = NativeFFmpeg.avcodec_alloc_context3(codec);
+        if (_ctx == null) throw new Exception("avcodec_alloc_context3 failed");
+
+        _ctx->thread_count = 1;
+        _ctx->thread_type  = 0;
+
+        int hr = NativeFFmpeg.avcodec_open2(_ctx, codec, null);
+        if (hr < 0) throw new Exception($"avcodec_open2 failed: {hr}");
+
+        _frame = NativeFFmpeg.av_frame_alloc();
+        if (_frame == null) throw new Exception("av_frame_alloc failed");
     }
 
     public unsafe void Decode(byte[] aacData, long ptsUs)
     {
-        using var packet = new Packet();
-        AVPacket* raw = packet;
+        if (_disposed) return;
 
-        if (ffmpeg.av_new_packet(raw, aacData.Length) < 0) return;
-        Marshal.Copy(aacData, 0, (nint)raw->data, aacData.Length);
-        raw->pts = ptsUs;
-
-        try { _codecCtx.SendPacket(packet); }
-        catch { return; }
-
-        while (true)
+        AVPacket* pkt = NativeFFmpeg.av_packet_alloc();
+        if (pkt == null) return;
+        try
         {
-            var result = _codecCtx.ReceiveFrame(_pcmFrame);
-            if (result == CodecResult.Again || result == CodecResult.EOF) break;
-            if ((int)result < 0) break;
+            if (NativeFFmpeg.av_new_packet(pkt, aacData.Length) < 0) return;
+            fixed (byte* src = aacData)
+                Buffer.MemoryCopy(src, pkt->data, aacData.Length, aacData.Length);
+            pkt->pts = ptsUs;
 
-            EmitPcm(ptsUs);
-            _pcmFrame.Unref();
+            if (NativeFFmpeg.avcodec_send_packet(_ctx, pkt) < 0) return;
+
+            while (true)
+            {
+                int result = NativeFFmpeg.avcodec_receive_frame(_ctx, _frame);
+                if (result == NativeFFmpeg.AVERROR_EAGAIN || result == NativeFFmpeg.AVERROR_EOF) break;
+                if (result < 0) break;
+
+                EmitPcm(ptsUs);
+                NativeFFmpeg.av_frame_unref(_frame);
+            }
+        }
+        finally
+        {
+            NativeFFmpeg.av_packet_free(&pkt);
         }
     }
 
-    /// <summary>
-    /// Convert FLTP (float planar, the native AAC decoder output format) to
-    /// S16 interleaved stereo — pure C# unsafe, no swresample dependency.
-    /// </summary>
     private unsafe void EmitPcm(long ptsUs)
     {
-        int sampleRate = _pcmFrame.SampleRate;
-        int nbSamples  = _pcmFrame.NbSamples;
+        int sampleRate = _frame->sample_rate;
+        int nbSamples  = _frame->nb_samples;
         if (sampleRate <= 0 || nbSamples <= 0) return;
+        if ((byte*)_frame->data[0] == null) return;
 
         // FLTP: each channel in its own plane as float[nbSamples]
-        float* left  = (float*)_pcmFrame.Data[0];
-        float* right = (float*)_pcmFrame.Data[1];
+        float* left  = (float*)_frame->data[0];
+        float* right = _frame->data[1] != 0 ? (float*)_frame->data[1] : left; // mono fallback
 
-        // S16 interleaved: [L0 R0 L1 R1 …] — 2 channels × 2 bytes × nbSamples
         byte[] output = new byte[nbSamples * 2 * 2];
-
         fixed (byte* dst = output)
         {
             short* s = (short*)dst;
@@ -88,17 +97,18 @@ public sealed class AacDecoder : IDisposable
         return (short)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
     }
 
-    public void Dispose()
+    public unsafe void Dispose()
     {
-        _pcmFrame.Dispose();
-        _codecCtx.Dispose();
+        if (_disposed) return;
+        _disposed = true;
+        if (_frame != null) { var f = _frame; _frame = null; NativeFFmpeg.av_frame_free(&f); }
+        if (_ctx   != null) { var c = _ctx;   _ctx   = null; NativeFFmpeg.avcodec_free_context(&c); }
     }
 }
 
 /// <summary>S16 interleaved PCM audio ready for WASAPI playback.</summary>
 public sealed class PcmFrame
 {
-    /// S16 little-endian interleaved: [L0 R0 L1 R1 …]
     public byte[] Data     { get; }
     public int    Rate     { get; }
     public int    Channels { get; }
